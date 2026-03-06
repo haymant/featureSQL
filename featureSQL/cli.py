@@ -219,12 +219,15 @@ class Run:
         max_symbols: int = None,
         max_memory: int = None,
         store_type: str = "fs",
+        reload: bool = False,
     ):
         """Execute an SQL query over the binary dataset using DuckDB.
 
         The query engine lazily loads symbol directories as needed and uses an
         LRU cache to limit memory/number of symbols.  ``sql`` should be a
-        valid SQL string referencing symbol names as table names.
+        valid SQL string referencing symbol names as table names.  If
+        ``reload`` is True symbol data is re-read from disk instead of using
+        the cache.
         """
         from .duck import DuckQueryService, LRUCache
         from .storage import get_storage
@@ -234,9 +237,27 @@ class Run:
 
         cache = LRUCache(max_symbols=max_symbols, max_memory=max_memory)
         svc = DuckQueryService(base, cache=cache, store=store)
-        df = svc.execute(sql)
-        # pretty print result
-        print(df.to_string(index=False))
+
+        # split multi‑statement strings so that a failure in one doesn't
+        # abort the entire batch.  DuckDB will raise on the first failing
+        # statement, so we handle exceptions per-statement here.
+        results = []
+        for part in sql.split(";"):
+            stmt = part.strip()
+            if not stmt:
+                continue
+            try:
+                df = svc.execute(stmt, reload=reload)
+                results.append(df)
+                print(df.to_string(index=False))
+            except Exception as e:
+                # we want to log the error but continue executing later
+                msg = str(e)
+                logger.error(msg)
+                print(msg)
+                # continue without appending a result
+        # nothing to return; CLI exists with 0 regardless of errors
+        return
 
 
 def main():

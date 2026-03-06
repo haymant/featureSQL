@@ -108,3 +108,4 @@ celerybeat-schedule
 
 source
 .test*
+tmp_*

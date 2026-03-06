@@ -3,6 +3,19 @@
 ## Objective
 Abstract file system operations to support creating, reading, updating, and deleting (CRUD) files across various storage backends.
 
+> **Note:** the feature database built on top of this storage abstraction
+> only supports numeric (float/float) columns for feature values.  Text or
+> other data types are not persisted.  The time index is represented by an
+> implicit `date` column which is always stored as a `TIMESTAMP` and
+> enforced as a **NOT NULL PRIMARY KEY** by the DuckDB engine; every
+> `INSERT` must supply a date and duplicate dates are rejected.
+>
+> DDL is intentionally very limited: the SQL layer supports `CREATE`,
+> `DROP` and `ALTER TABLE` for adding/dropping numeric columns.  When a
+> column is added a zero‑filled `.day.bin` file is created with a length
+> that matches the rest of the table; dropping a column simply removes the
+> corresponding file.
+
 ## Supported Storage Types (Enum: `StoreType`)
 1. `fs`: Local File System (Default)
 2. `gcs`: Google Cloud Storage

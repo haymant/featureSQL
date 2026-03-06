@@ -144,6 +144,17 @@ Once you have an initialised dataset you can issue SQL against it.  The
 ``query`` subcommand lazily loads only the symbols mentioned in the query
 and keeps a small LRU cache in memory.
 
+> **Note:** every table implicitly includes a `date` column of type
+> `TIMESTAMP`.  This column is considered the primary key and is always
+> `NOT NULL`—you must provide a date value on `INSERT`, and attempts to
+> insert duplicate dates will fail with a constraint error.
+>
+> **DDL support:** the engine understands basic `CREATE`, `DROP`, `ALTER
+> TABLE … ADD/DROP COLUMN` and simple `UPDATE`/`INSERT`/`DELETE`
+> statements.  Adding or removing a column automatically creates or
+> deletes the corresponding `.day.bin` file and keeps its length in sync
+> with existing data, so you can evolve your schema in-place.
+
 ```bash
 uv run -m featureSQL.cli query \
     --data_path source \
@@ -161,6 +172,46 @@ uv run -m featureSQL.cli query --data_path source --store_type fs \
 ```
 
 (The cache flags are optional; omit them to use unlimited resources.)
+
+---
+
+### 4.1 Example: run a sequence of SQL commands
+
+The CLI can also be used interactively or in a script to exercise the
+entire life‑cycle of a DuckDB table.  One convenient property of the
+command is that it continues executing subsequent statements even if one
+of the earlier ones fails (for instance, attempting to `DROP` or
+`DESCRIBE` a table that doesn’t exist).  In such cases it prints a friendly
+message but exits with a zero status, making it safe to run whole
+scripts without worrying about short‑circuiting.
+
+Below is a step‑by‑step sequence that matches the unit test we added earlier; it’s useful when you want to
+verify that basic DDL/DML operations are behaving as expected.
+
+```bash
+# start a DuckDB session using the same Python runtime as the package
+uv run -m featureSQL.cli query --data_path source --store_type fs \
+    "\
+    drop table foo;                     -- not present; CLI prints a message but continues\
+    describe foo;                      -- should report missing table\
+    create table foo (id int, price float, amount float);\
+    describe foo;                      -- now shows three columns (date plus two numeric)
+    insert into foo values ('2026-03-01',1,100.0),('2026-03-02',2,200.0);\
+    select * from foo order by id;      -- two rows present\
+    update foo set id = 10 where price=1;\
+    select id from foo where price=1; -- id==10\
+    alter table foo add disc float;     -- add a new numeric column\
+    select * from foo;                 -- new column shows as NULL\
+    alter table foo drop disc;         -- remove the column again\
+    drop table foo;                     -- remove table\
+    describe foo;                      -- failure again
+    "
+```
+
+You can run the same commands one‑by‑one in an interactive Python REPL if
+preferred; they simply exercise the underlying DuckDB engine that our
+`DuckQueryService` uses.  This sequence is especially handy for sanity
+checks when changing the SQL layer or adding new features.
 ---
 
 ### Notes & tips
