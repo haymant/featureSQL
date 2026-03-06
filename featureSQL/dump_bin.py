@@ -50,7 +50,7 @@ def fname_to_code(fname: str):
     return fname
 
 
-def read_as_df(file_path: Union[str, Path], **kwargs) -> pd.DataFrame:
+def read_as_df(file_path: Union[str, Path], store=None, **kwargs) -> pd.DataFrame:
     """
     Read a csv or parquet file into a pandas DataFrame.
 
@@ -58,6 +58,7 @@ def read_as_df(file_path: Union[str, Path], **kwargs) -> pd.DataFrame:
     ----------
     file_path : Union[str, Path]
         Path to the data file.
+    store : Option storage backend.
     **kwargs :
         Additional keyword arguments passed to the underlying pandas
         reader.
@@ -66,8 +67,13 @@ def read_as_df(file_path: Union[str, Path], **kwargs) -> pd.DataFrame:
     -------
     pd.DataFrame
     """
-    file_path = Path(file_path).expanduser()
-    suffix = file_path.suffix.lower()
+    from .storage import get_storage, FileSystemStore
+    if store is None:
+        store = get_storage("fs")
+
+    # stringify to deal with non-fs paths uniformly
+    file_str = str(file_path)
+    suffix = pathlib_suffix(file_str)
 
     keep_keys = {".csv": ("low_memory",)}
     kept_kwargs = {}
@@ -76,18 +82,28 @@ def read_as_df(file_path: Union[str, Path], **kwargs) -> pd.DataFrame:
             kept_kwargs[k] = kwargs[k]
 
     if suffix == ".csv":
-        # read normally but immediately coerce any pandas "string" extension
-        # dtypes into plain object arrays; otherwise concat later on can fail
-        # with the familiar "Cannot interpret '<StringDtype(...)>' as a data
-        # type" error.
-        df = pd.read_csv(file_path, **kept_kwargs)
+        import io
+        if isinstance(store, FileSystemStore):
+            df = pd.read_csv(file_path, **kept_kwargs)
+        else:
+            df = pd.read_csv(io.BytesIO(store.read_bytes(file_str)), **kept_kwargs)
         for col in df.select_dtypes(include=["string"]):
             df[col] = df[col].astype("object")
         return df
     elif suffix == ".parquet":
-        return pd.read_parquet(file_path, **kept_kwargs)
+        if isinstance(store, FileSystemStore):
+            return pd.read_parquet(file_path, **kept_kwargs)
+        else:
+            import io
+            return pd.read_parquet(io.BytesIO(store.read_bytes(file_str)), **kept_kwargs)
     else:
         raise ValueError(f"Unsupported file format: {suffix}")
+
+def pathlib_suffix(p: str) -> str:
+    p = str(p)
+    if "." in p.split("/")[-1]:
+        return "." + p.split("/")[-1].split(".")[-1].lower()
+    return ""
 
 
 class DumpDataBase:
@@ -118,6 +134,7 @@ class DumpDataBase:
         exclude_fields: str = "",
         include_fields: str = "",
         limit_nums: int = None,
+        store_type: str = "fs",
     ):
         """
 
@@ -145,8 +162,34 @@ class DumpDataBase:
             fields not dumped
         limit_nums: int
             Use when debugging, default None
+        store_type: str
+            the storage backend type
         """
-        data_path = Path(data_path).expanduser()
+        from .storage import get_storage
+        self.store = get_storage(store_type, dump_dir)
+        self.store_type = store_type
+
+        # data_path might be bucket/prefix in GCS
+        if store_type == "fs":
+            data_path_obj = Path(data_path).expanduser()
+            if data_path_obj.is_dir():
+                self.df_files = sorted([str(p) for p in data_path_obj.glob(f"*{file_suffix}")])
+            else:
+                self.df_files = [str(data_path_obj)]
+        else:
+            self.df_files = sorted(self.store.glob(data_path, f"*{file_suffix}"))
+            # eliminate any entries that don't actually end in the expected suffix
+            self.df_files = [f for f in self.df_files if pathlib_suffix(f) == file_suffix]
+            if not self.df_files:
+                # if the user provided a direct file path matching suffix, honor it;
+                # otherwise treat this as an error since no matching files were found.
+                if pathlib_suffix(data_path) == file_suffix:
+                    self.df_files = [data_path]
+                else:
+                    raise FileNotFoundError(
+                        f"no files with suffix '{file_suffix}' found under '{data_path}' on store '{store_type}'"
+                    )
+        
         if isinstance(exclude_fields, str):
             exclude_fields = exclude_fields.split(",")
         if isinstance(include_fields, str):
@@ -155,13 +198,17 @@ class DumpDataBase:
         self._include_fields = tuple(filter(lambda x: len(x) > 0, map(str.strip, include_fields)))
         self.file_suffix = file_suffix
         self.symbol_field_name = symbol_field_name
-        self.df_files = sorted(data_path.glob(f"*{self.file_suffix}") if data_path.is_dir() else [data_path])
+
         if limit_nums is not None:
             self.df_files = self.df_files[: int(limit_nums)]
-        self.dump_dir = Path(dump_dir).expanduser()
-        self.backup_dir = backup_dir if backup_dir is None else Path(backup_dir).expanduser()
+            
+        self.dump_dir = str(Path(dump_dir).expanduser()) if store_type == "fs" else dump_dir
+        
         if backup_dir is not None:
-            self._backup_dir(Path(backup_dir).expanduser())
+            self.backup_dir = str(Path(backup_dir).expanduser()) if store_type == "fs" else backup_dir
+            self._backup_dir(self.backup_dir)
+        else:
+            self.backup_dir = None
 
         self.freq = freq
         self.calendar_format = self.DAILY_FORMAT if self.freq == "day" else self.HIGH_FREQ_FORMAT
@@ -169,25 +216,38 @@ class DumpDataBase:
         self.works = max_workers
         self.date_field_name = date_field_name
 
-        self._calendars_dir = self.dump_dir.joinpath(self.CALENDARS_DIR_NAME)
-        self._features_dir = self.dump_dir.joinpath(self.FEATURES_DIR_NAME)
-        self._instruments_dir = self.dump_dir.joinpath(self.INSTRUMENTS_DIR_NAME)
+        self._calendars_dir = self.store.joinpath(self.dump_dir, self.CALENDARS_DIR_NAME)
+        self._features_dir = self.store.joinpath(self.dump_dir, self.FEATURES_DIR_NAME)
+        self._instruments_dir = self.store.joinpath(self.dump_dir, self.INSTRUMENTS_DIR_NAME)
 
         self._calendars_list = []
 
         self._mode = self.ALL_MODE
         self._kwargs = {}
 
-    def _backup_dir(self, target_dir: Path):
-        shutil.copytree(str(self.dump_dir.resolve()), str(target_dir.resolve()))
+    def _backup_dir(self, target_dir: str):
+        if self.store_type == "fs":
+            shutil.copytree(str(Path(self.dump_dir).resolve()), str(Path(target_dir).resolve()))
+        else:
+            logger.warning("backup_dir is not yet fully supported for non-fs storage")
 
     def _format_datetime(self, datetime_d: [str, pd.Timestamp]):
         datetime_d = pd.Timestamp(datetime_d)
         return datetime_d.strftime(self.calendar_format)
 
     def _get_date(
-        self, file_or_df: [Path, pd.DataFrame], *, is_begin_end: bool = False, as_set: bool = False
+        self, file_or_df: [str, pd.DataFrame], *, is_begin_end: bool = False, as_set: bool = False
     ) -> Iterable[pd.Timestamp]:
+        # guard against invalid file paths that slipped through
+        if isinstance(file_or_df, str) and not file_or_df:
+            # empty string, nothing to read
+            if is_begin_end and as_set:
+                return (None, None), set()
+            if is_begin_end:
+                return None, None
+            if as_set:
+                return set()
+            return []
         if not isinstance(file_or_df, pd.DataFrame):
             df = self._get_source_data(file_or_df)
         else:
@@ -206,15 +266,17 @@ class DumpDataBase:
         else:
             return _calendars.tolist()
 
-    def _get_source_data(self, file_path: Path) -> pd.DataFrame:
-        df = read_as_df(file_path, low_memory=False)
+    def _get_source_data(self, file_path: str) -> pd.DataFrame:
+        df = read_as_df(file_path, store=self.store, low_memory=False)
         if self.date_field_name in df.columns:
             df[self.date_field_name] = pd.to_datetime(df[self.date_field_name])
         # df.drop_duplicates([self.date_field_name], inplace=True)
         return df
 
-    def get_symbol_from_file(self, file_path: Path) -> str:
-        return fname_to_code(file_path.stem.strip().lower())
+    def get_symbol_from_file(self, file_path: str) -> str:
+        # file_path is string
+        stem = str(file_path).split("/")[-1].split(".")[0]
+        return fname_to_code(stem.strip().lower())
 
     def get_dump_fields(self, df_columns: Iterable[str]) -> Iterable[str]:
         return (
@@ -223,46 +285,80 @@ class DumpDataBase:
             else set(df_columns) - set(self._exclude_fields) if self._exclude_fields else df_columns
         )
 
-    @staticmethod
-    def _read_calendars(calendar_path: Path) -> List[pd.Timestamp]:
+    def _read_calendars(self, calendar_path: str) -> List[pd.Timestamp]:
+        import io
+        if self.store_type == "fs":
+            df = pd.read_csv(calendar_path, header=None)
+        else:
+            df = pd.read_csv(io.BytesIO(self.store.read_bytes(calendar_path)), header=None)
+            
         return sorted(
             map(
                 pd.Timestamp,
-                pd.read_csv(calendar_path, header=None).loc[:, 0].tolist(),
+                df.loc[:, 0].tolist(),
             )
         )
 
-    def _read_instruments(self, instrument_path: Path) -> pd.DataFrame:
-        df = pd.read_csv(
-            instrument_path,
-            sep=self.INSTRUMENTS_SEP,
-            names=[
-                self.symbol_field_name,
-                self.INSTRUMENTS_START_FIELD,
-                self.INSTRUMENTS_END_FIELD,
-            ],
-        )
+    def _read_instruments(self, instrument_path: str) -> pd.DataFrame:
+        import io
+        if self.store_type == "fs":
+            df = pd.read_csv(
+                instrument_path,
+                sep=self.INSTRUMENTS_SEP,
+                names=[
+                    self.symbol_field_name,
+                    self.INSTRUMENTS_START_FIELD,
+                    self.INSTRUMENTS_END_FIELD,
+                ],
+            )
+        else:
+            df = pd.read_csv(
+                io.BytesIO(self.store.read_bytes(instrument_path)),
+                sep=self.INSTRUMENTS_SEP,
+                names=[
+                    self.symbol_field_name,
+                    self.INSTRUMENTS_START_FIELD,
+                    self.INSTRUMENTS_END_FIELD,
+                ],
+            )
 
         return df
 
     def save_calendars(self, calendars_data: list):
-        self._calendars_dir.mkdir(parents=True, exist_ok=True)
-        calendars_path = str(self._calendars_dir.joinpath(f"{self.freq}.txt").expanduser().resolve())
+        self.store.mkdir(self._calendars_dir, parents=True, exist_ok=True)
+        calendars_path = self.store.joinpath(self._calendars_dir, f"{self.freq}.txt")
         result_calendars_list = [self._format_datetime(x) for x in calendars_data]
-        np.savetxt(calendars_path, result_calendars_list, fmt="%s", encoding="utf-8")
+        if self.store_type == "fs":
+            np.savetxt(calendars_path, result_calendars_list, fmt="%s", encoding="utf-8")
+        else:
+            import io
+            bio = io.BytesIO()
+            np.savetxt(bio, result_calendars_list, fmt="%s", encoding="utf-8")
+            self.store.write_bytes(calendars_path, bio.getvalue())
 
     def save_instruments(self, instruments_data: Union[list, pd.DataFrame]):
-        self._instruments_dir.mkdir(parents=True, exist_ok=True)
-        instruments_path = str(self._instruments_dir.joinpath(self.INSTRUMENTS_FILE_NAME).resolve())
+        self.store.mkdir(self._instruments_dir, parents=True, exist_ok=True)
+        instruments_path = self.store.joinpath(self._instruments_dir, self.INSTRUMENTS_FILE_NAME)
+        import io
         if isinstance(instruments_data, pd.DataFrame):
             _df_fields = [self.symbol_field_name, self.INSTRUMENTS_START_FIELD, self.INSTRUMENTS_END_FIELD]
             instruments_data = instruments_data.loc[:, _df_fields]
             instruments_data[self.symbol_field_name] = instruments_data[self.symbol_field_name].apply(
                 lambda x: fname_to_code(x.lower()).upper()
             )
-            instruments_data.to_csv(instruments_path, header=False, sep=self.INSTRUMENTS_SEP, index=False)
+            if self.store_type == "fs":
+                instruments_data.to_csv(instruments_path, header=False, sep=self.INSTRUMENTS_SEP, index=False)
+            else:
+                bio = io.BytesIO()
+                instruments_data.to_csv(bio, header=False, sep=self.INSTRUMENTS_SEP, index=False)
+                self.store.write_bytes(instruments_path, bio.getvalue())
         else:
-            np.savetxt(instruments_path, instruments_data, fmt="%s", encoding="utf-8")
+            if self.store_type == "fs":
+                np.savetxt(instruments_path, instruments_data, fmt="%s", encoding="utf-8")
+            else:
+                bio = io.BytesIO()
+                np.savetxt(bio, instruments_data, fmt="%s", encoding="utf-8")
+                self.store.write_bytes(instruments_path, bio.getvalue())
 
     def data_merge_calendar(self, df: pd.DataFrame, calendars_list: List[pd.Timestamp]) -> pd.DataFrame:
         # calendars
@@ -282,9 +378,9 @@ class DumpDataBase:
     def get_datetime_index(df: pd.DataFrame, calendar_list: List[pd.Timestamp]) -> int:
         return calendar_list.index(df.index.min())
 
-    def _data_to_bin(self, df: pd.DataFrame, calendar_list: List[pd.Timestamp], features_dir: Path):
+    def _data_to_bin(self, df: pd.DataFrame, calendar_list: List[pd.Timestamp], features_dir: str, code: str):
         if df.empty:
-            logger.warning(f"{features_dir.name} data is None or empty")
+            logger.warning(f"{code} data is None or empty")
             return
         if not calendar_list:
             logger.warning("calendar_list is empty")
@@ -292,25 +388,31 @@ class DumpDataBase:
         # align index
         _df = self.data_merge_calendar(df, calendar_list)
         if _df.empty:
-            logger.warning(f"{features_dir.name} data is not in calendars")
+            logger.warning(f"{code} data is not in calendars")
             return
         # used when creating a bin file
         date_index = self.get_datetime_index(_df, calendar_list)
         for field in self.get_dump_fields(_df.columns):
-            bin_path = features_dir.joinpath(f"{field.lower()}.{self.freq}{self.DUMP_FILE_SUFFIX}")
+            bin_path = self.store.joinpath(features_dir, f"{field.lower()}.{self.freq}{self.DUMP_FILE_SUFFIX}")
             if field not in _df.columns:
                 continue
-            if bin_path.exists() and self._mode == self.UPDATE_MODE:
+            if self.store.exists(bin_path) and self._mode == self.UPDATE_MODE:
                 # update
-                with bin_path.open("ab") as fp:
-                    np.array(_df[field]).astype("<f").tofile(fp)
-                logger.info(f"updated bin file: {bin_path.name} (symbol={features_dir.name}, field={field})")
+                if self.store_type == "fs":
+                    with Path(bin_path).open("ab") as fp:
+                        np.array(_df[field]).astype("<f").tofile(fp)
+                else:
+                    self.store.append_bytes(bin_path, np.array(_df[field]).astype("<f").tobytes())
+                logger.info(f"updated bin file: {bin_path} (symbol={code}, field={field})")
             else:
                 # append; self._mode == self.ALL_MODE or not bin_path.exists()
-                np.hstack([date_index, _df[field]]).astype("<f").tofile(str(bin_path.resolve()))
-                logger.info(f"created/overwritten bin file: {bin_path.name} (symbol={features_dir.name}, field={field})")
+                if self.store_type == "fs":
+                    np.hstack([date_index, _df[field]]).astype("<f").tofile(str(Path(bin_path).resolve()))
+                else:
+                    self.store.write_bytes(bin_path, np.hstack([date_index, _df[field]]).astype("<f").tobytes())
+                logger.info(f"created/overwritten bin file: {bin_path} (symbol={code}, field={field})")
 
-    def _dump_bin(self, file_or_data: [Path, pd.DataFrame], calendar_list: List[pd.Timestamp]):
+    def _dump_bin(self, file_or_data: [str, pd.DataFrame], calendar_list: List[pd.Timestamp]):
         if not calendar_list:
             logger.warning("calendar_list is empty")
             return
@@ -319,7 +421,7 @@ class DumpDataBase:
                 return
             code = fname_to_code(str(file_or_data.iloc[0][self.symbol_field_name]).lower())
             df = file_or_data
-        elif isinstance(file_or_data, Path):
+        elif isinstance(file_or_data, (str, Path)):
             code = self.get_symbol_from_file(file_or_data)
             df = self._get_source_data(file_or_data)
         else:
@@ -332,9 +434,9 @@ class DumpDataBase:
         df = df.drop_duplicates(self.date_field_name)
 
         # features save dir
-        features_dir = self._features_dir.joinpath(code_to_fname(code).lower())
-        features_dir.mkdir(parents=True, exist_ok=True)
-        self._data_to_bin(df, calendar_list, features_dir)
+        features_dir = self.store.joinpath(self._features_dir, code_to_fname(code).lower())
+        self.store.mkdir(features_dir, parents=True, exist_ok=True)
+        self._data_to_bin(df, calendar_list, features_dir, code)
 
     @abc.abstractmethod
     def dump(self):
@@ -350,8 +452,9 @@ class DumpDataAll(DumpDataBase):
         all_datetime = set()
         date_range_list = []
         _fun = partial(self._get_date, as_set=True, is_begin_end=True)
+        executor_class = ProcessPoolExecutor if self.store_type == "fs" else ThreadPoolExecutor
         with tqdm(total=len(self.df_files)) as p_bar:
-            with ProcessPoolExecutor(max_workers=self.works) as executor:
+            with executor_class(max_workers=self.works) as executor:
                 for file_path, ((_begin_time, _end_time), _set_calendars) in zip(
                     self.df_files, executor.map(_fun, self.df_files)
                 ):
@@ -381,8 +484,9 @@ class DumpDataAll(DumpDataBase):
     def _dump_features(self):
         logger.info("start dump features......")
         _dump_func = partial(self._dump_bin, calendar_list=self._calendars_list)
+        executor_class = ProcessPoolExecutor if self.store_type == "fs" else ThreadPoolExecutor
         with tqdm(total=len(self.df_files)) as p_bar:
-            with ProcessPoolExecutor(max_workers=self.works) as executor:
+            with executor_class(max_workers=self.works) as executor:
                 for _ in executor.map(_dump_func, self.df_files):
                     p_bar.update()
 
@@ -420,10 +524,12 @@ class DumpDataFix(DumpDataAll):
         logger.info("end of instruments dump.\n")
 
     def dump(self):
-        self._calendars_list = self._read_calendars(self._calendars_dir.joinpath(f"{self.freq}.txt"))
+        cal_path = self.store.joinpath(self._calendars_dir, f"{self.freq}.txt")
+        self._calendars_list = self._read_calendars(cal_path)
         # noinspection PyAttributeOutsideInit
+        inst_path = self.store.joinpath(self._instruments_dir, self.INSTRUMENTS_FILE_NAME)
         self._old_instruments = (
-            self._read_instruments(self._instruments_dir.joinpath(self.INSTRUMENTS_FILE_NAME))
+            self._read_instruments(inst_path)
             .set_index([self.symbol_field_name])
             .to_dict(orient="index")
         )  # type: dict
@@ -445,34 +551,8 @@ class DumpDataUpdate(DumpDataBase):
         exclude_fields: str = "",
         include_fields: str = "",
         limit_nums: int = None,
+        store_type: str = "fs",
     ):
-        """
-
-        Parameters
-        ----------
-        data_path: str
-            stock data path or directory
-        dump_dir: str
-            target directory for generated binary files
-        backup_dir: str, default None
-            if backup_dir is not None, backup dump_dir to backup_dir
-        freq: str, default "day"
-            transaction frequency
-        max_workers: int, default None
-            number of threads
-        date_field_name: str, default "date"
-            the name of the date field in the csv
-        file_suffix: str, default ".csv"
-            file suffix
-        symbol_field_name: str, default "symbol"
-            symbol field name
-        include_fields: tuple
-            dump fields
-        exclude_fields: tuple
-            fields not dumped
-        limit_nums: int
-            Use when debugging, default None
-        """
         super().__init__(
             data_path,
             dump_dir,
@@ -484,13 +564,17 @@ class DumpDataUpdate(DumpDataBase):
             symbol_field_name,
             exclude_fields,
             include_fields,
+            limit_nums,
+            store_type=store_type,
         )
         self._mode = self.UPDATE_MODE
-        self._old_calendar_list = self._read_calendars(self._calendars_dir.joinpath(f"{self.freq}.txt"))
+        cal_path = self.store.joinpath(self._calendars_dir, f"{self.freq}.txt")
+        self._old_calendar_list = self._read_calendars(cal_path)
         # NOTE: all.txt only exists once for each stock
         # NOTE: if a stock corresponds to multiple different time ranges, user need to modify self._update_instruments
+        inst_path = self.store.joinpath(self._instruments_dir, self.INSTRUMENTS_FILE_NAME)
         self._update_instruments = (
-            self._read_instruments(self._instruments_dir.joinpath(self.INSTRUMENTS_FILE_NAME))
+            self._read_instruments(inst_path)
             .set_index([self.symbol_field_name])
             .to_dict(orient="index")
         )  # type: dict

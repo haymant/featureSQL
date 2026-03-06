@@ -5,10 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "build>=1.4.0",
     "duckdb>=1.4.4",
     "fire>=0.7.1",
+    "google-auth>=2.48.0",
+    "google-cloud-storage>=3.9.0",
     "loguru>=0.7.3",
     "numpy>=2.4.2",
     "pytest>=9.0.2",
+    "twine>=6.2.0",
     "yahooquery>=2.4.1",
 ]

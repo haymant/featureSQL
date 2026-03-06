@@ -32,24 +32,36 @@ class Run:
         reload_symbols: bool = False,
         data_path: str = None,
         out_format: str = "csv",
+        store_type: str = "fs",
     ):
+        from .storage import get_storage
+        store = get_storage(store_type, data_path)
+
         # determine symbol_list either from explicit symbols or file
         sym_list = None
         if symbols_file:
-            path = Path(symbols_file).expanduser()
-            if path.exists():
-                sym_list = [s.strip().upper() for s in path.read_text().splitlines() if s.strip()]
+            path = symbols_file
+            if store_type == "fs":
+                path_obj = Path(symbols_file).expanduser()
+                if path_obj.exists():
+                    sym_list = [s.strip().upper() for s in path_obj.read_text().splitlines() if s.strip()]
+                else:
+                    logger.warning(f"symbols_file {path} does not exist")
             else:
-                logger.warning(f"symbols_file {path} does not exist")
+                if store.exists(path):
+                    sym_list = [s.strip().upper() for s in store.read_text(path).splitlines() if s.strip()]
+                else:
+                    logger.warning(f"symbols_file {path} does not exist in {store_type}")
+
             # if the file exists but is empty, we still want to treat that as an
             # intentional (albeit odd) request to download nothing rather than
             # blow up and fetch the full universe.
             if reload_symbols or sym_list is None:
                 # fetch fresh and optionally write back (only if explicitly
                 # requested via reload_symbols)
-                sym_list = get_us_stock_symbols(reload=True, data_path=data_path)
+                sym_list = get_us_stock_symbols(reload=True, data_path=data_path, store=store)
                 try:
-                    path.write_text("\n".join(sym_list))
+                    store.write_text(path, "\n".join(sym_list))
                 except Exception:
                     logger.warning(f"could not write symbol file {path}")
         elif symbols:
@@ -59,18 +71,15 @@ class Run:
             else:
                 sym_list = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
 
-        # if the caller passed a data_path we create a subdirectory for
-        # feature CSVs; otherwise we also use a feature-csv subdir under the
-        # configured source directory.  this keeps the top‑level dump/output
-        # directory clean and mirrors what some external tooling expects.
-        if data_path is not None:
-            base = Path(data_path).expanduser()
-        else:
-            base = Path(self.source_dir).expanduser()
-        csv_dir = base.joinpath("feature-csv")
+        # if the caller passed a data_path we use that as the base;
+        # otherwise fall back to the configured source directory.  the
+        # storage backend will interpret the base string appropriately (e.g.
+        # a bucket name/prefix for GCS).
+        base = data_path if data_path is not None else self.source_dir
+        csv_dir = store.joinpath(base, "feature-csv")
 
         if region.upper() == "US":
-            collector = YahooCollectorUS(str(csv_dir), symbol_list=sym_list)
+            collector = YahooCollectorUS(str(csv_dir), symbol_list=sym_list, store=store)
         else:
             raise ValueError("region not supported")
         collector.download_data(start=start, end=end)
@@ -81,38 +90,53 @@ class Run:
                 # import from the package rather than a top-level module
                 from .dump_bin import DumpDataUpdate, DumpDataAll
 
-                dump_dir = data_path if data_path is not None else str(csv_dir)
-                dump_path = Path(dump_dir)
+                dump_dir = data_path if data_path is not None else csv_dir
                 # decide whether to do a full initial dump or an update; the
                 # former is required if the target directory does not yet
                 # contain a calendar file.
-                cal_file = dump_path.joinpath("calendars", "day.txt")
-                if cal_file.exists():
+                cal_file = store.joinpath(dump_dir, "calendars", "day.txt")
+                if store.exists(cal_file):
                     dumper = DumpDataUpdate(
                         data_path=str(csv_dir),
                         dump_dir=dump_dir,
                         exclude_fields="symbol,date",
+                        store_type=store_type,
                     )
                 else:
-                    # ensure parent dirs exist
-                    dump_path.mkdir(parents=True, exist_ok=True)
                     dumper = DumpDataAll(
                         data_path=str(csv_dir),
                         dump_dir=dump_dir,
                         exclude_fields="symbol,date",
+                        store_type=store_type,
                     )
                 dumper.dump()
             except Exception as e:
                 logger.warning(f"unable to perform binary dump: {e}")
 
-    def normalize(self, source_dir: str = None):
-        src = Path(source_dir or self.source_dir)
-        for csv in src.glob("*.csv"):
-            df = pd.read_csv(csv)
+    def normalize(self, source_dir: str = None, store_type: str = "fs"):
+        from .storage import get_storage
+        store = get_storage(store_type, source_dir or self.source_dir)
+        src = source_dir or self.source_dir
+        
+        # This uses pandas directly heavily, we will adapt it
+        import io
+        for csv_path in store.glob(src, "*.csv"):
+            if store_type == "fs":
+                df = pd.read_csv(csv_path)
+            else:
+                csv_bytes = store.read_bytes(csv_path)
+                df = pd.read_csv(io.BytesIO(csv_bytes))
+                
             df2 = YahooNormalize.normalize_yahoo(df)
-            df2.to_csv(csv, index=False)
+            
+            if store_type == "fs":
+                df2.to_csv(csv_path, index=False)
+            else:
+                csv_buffer = io.StringIO()
+                df2.to_csv(csv_buffer, index=False)
+                store.write_text(csv_path, csv_buffer.getvalue())
 
-    def view(self, bin_file: str, calendar_file: str = None):
+    def view(self, bin_file: str, calendar_file: str = None, store_type: str = "fs", data_path: str = None):
         """Print basic information about a binary feature file.
 
         The bin format starts with a 4-byte date index followed by
@@ -123,17 +147,23 @@ class Run:
         bin file location) this helper will print the corresponding date for
         each value.
         """
-        path = Path(bin_file).expanduser()
-        if not path.exists():
-            logger.error(f"file not found: {path}")
+        from .storage import get_storage
+        # for gcs, bucket is data_path
+        store = get_storage(store_type, data_path)
+
+        if not store.exists(bin_file):
+            logger.error(f"file not found: {bin_file}")
             return
         try:
-            arr = np.fromfile(path, dtype="<f")
+            if store_type == "fs":
+                arr = np.fromfile(bin_file, dtype="<f")
+            else:
+                arr = np.frombuffer(store.read_bytes(bin_file), dtype="<f")
         except Exception as e:
-            logger.error(f"unable to read file {path}: {e}")
+            logger.error(f"unable to read file {bin_file}: {e}")
             return
         if arr.size == 0:
-            print(f"{path} is empty")
+            print(f"{bin_file} is empty")
             return
         date_index = int(arr[0])
         values = arr[1:]
@@ -142,20 +172,34 @@ class Run:
         dates = None
         # locate calendar if not given
         if calendar_file:
-            cal_path = Path(calendar_file).expanduser()
+            cal_path = calendar_file
         else:
-            cal_path = path
-            for _ in range(5):
-                cal_path = cal_path.parent
-                candidate = cal_path.joinpath("calendars/day.txt")
-                if candidate.exists():
-                    cal_path = candidate
-                    break
+            if store_type == "fs":
+                path = Path(bin_file).expanduser()
+                cal_path = path
+                for _ in range(5):
+                    cal_path = cal_path.parent
+                    candidate = cal_path.joinpath("calendars/day.txt")
+                    if candidate.exists():
+                        cal_path = candidate
+                        break
+                else:
+                    cal_path = None
+                if cal_path: cal_path = str(cal_path)
             else:
+                # GCS is flat, try removing segments
+                parts = bin_file.split("/")
                 cal_path = None
-        if cal_path and cal_path.exists():
+                for i in range(len(parts)-1, 0, -1):
+                    prefix = "/".join(parts[:i])
+                    candidate = f"{prefix}/calendars/day.txt" if prefix else "calendars/day.txt"
+                    if store.exists(candidate):
+                        cal_path = candidate
+                        break
+                        
+        if cal_path and store.exists(cal_path):
             try:
-                dates = [line.strip() for line in cal_path.read_text().splitlines() if line.strip()]
+                dates = [line.strip() for line in store.read_text(cal_path).splitlines() if line.strip()]
             except Exception:
                 dates = None
         if dates is not None:
@@ -174,6 +218,7 @@ class Run:
         data_path: str = None,
         max_symbols: int = None,
         max_memory: int = None,
+        store_type: str = "fs",
     ):
         """Execute an SQL query over the binary dataset using DuckDB.
 
@@ -182,10 +227,13 @@ class Run:
         valid SQL string referencing symbol names as table names.
         """
         from .duck import DuckQueryService, LRUCache
+        from .storage import get_storage
 
-        base = Path(data_path) if data_path is not None else Path(self.source_dir)
+        base = data_path if data_path is not None else self.source_dir
+        store = get_storage(store_type, base)
+
         cache = LRUCache(max_symbols=max_symbols, max_memory=max_memory)
-        svc = DuckQueryService(base, cache=cache)
+        svc = DuckQueryService(base, cache=cache, store=store)
         df = svc.execute(sql)
         # pretty print result
         print(df.to_string(index=False))

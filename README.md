@@ -51,25 +51,44 @@ uv run -m featureSQL.cli download \
     --start 2026-01-01 \
     --end   2026-02-28 \
     --symbols_file ./.testsymbols.txt \
-    --data_path ./source   # defaults to ./source (csvs go into ./source/feature-csv)
+    --data_path ./source \
+    --store_type fs   # Output to local fs (default). Change to 'gcs' and set data_path to bucket name for GCS.
 ```
 
-*Files created*: `/path/to/target/csv/dir/feature-csv/AAPL.csv`,
-`feature-csv/AMZN.csv`, … (i.e. `feature-csv` under the directory you
-passed with `--data_path`).  Each CSV contains the usual Open/Close/High/Low/
-Volume/AdjClose data plus `symbol`/`date` columns.
-
----
-
-## 2. Convert a directory of CSVs into a binary dataset
-
-This is the “dump all” step: it reads **all** CSV files in `data_path` and builds the calendar, instruments list and feature bins in the standard binary layout.
+> **GCS setup:** when using `--store_type gcs` you must configure two
+> environment variables before running any commands or tests:
+>
+> ```bash
+> export GCS_SC_JSON='{"type":"service_account", …}'    # credentials
+> export GCS_BUCKET_NAME='your-bucket-name'               # target bucket
+> ```
+>
+> The unit tests will skip network‑dependent scenarios if `GCS_BUCKET_NAME`
+> is unset, and they mock the client in other cases.  However, any manual
+> invocation against a real bucket requires both variables to be set.
+>
+> **Publishing:** to push a new release to PyPI, follow these steps:
+>
+> 1. build the package:
+>    ```bash
+>    uv run -m build
+>    ```
+> 2. optionally test the release on TestPyPI:
+>    ```bash
+>    uv run -m twine upload --repository testpypi dist/*
+>    uv pip install --index-url https://test.pypi.org/simple/ --no-deps featureSQL
+>    ```
+> 3. when ready for production, upload to PyPI:
+>    ```bash
+>    uv run -m twine upload dist/*
+>    ```
 
 ```bash
 uv run -m featureSQL.dump_bin dump_all \
     --data_path ./source/feature-csv \
     --dump_dir   ./source/ \
-    --exclude_fields symbol,date            # don’t try to treat metadata as floats
+    --exclude_fields symbol,date \
+    --store_type fs         # don’t try to treat metadata as floats.
 # (./source/ is /path/to/output/dir/)
 ```
 
@@ -101,7 +120,8 @@ uv run -m featureSQL.cli download \
     --end   2026-02-28 \
     --symbols AMZN,GOOG,TSLA \
     --data_path source  \
-    --out_format bin
+    --out_format bin \
+    --store_type fs
 ```
 
 This will
@@ -129,13 +149,14 @@ uv run -m featureSQL.cli query \
     --data_path source \
     --max_symbols 100 \
     --max_memory 2000000000 \
-    "select date, open, close, high, low, volume, adjust from AAPL where volume > 1000000"
+    --store_type fs \
+    "select date, open, close, high, low, volume, adjclose from AAPL where volume > 1000000"
 ```
 
 Joins work transparently as long as both tables have been dumped:
 
 ```bash
-uv run -m featureSQL.cli query --data_path source \
+uv run -m featureSQL.cli query --data_path source --store_type fs \
     "select a.open, n.close from AAPL a join NVDA n on a.date = n.date"
 ```
 
@@ -197,7 +218,7 @@ A new CLI subcommand makes this easy without writing Python.  Once you have
 an initialised dataset you can inspect any field file with:
 
 ```bash
-uv run -m featureSQL.cli view /path/to/output/dir/features/aapl/open.day.bin
+uv run -m featureSQL.cli view /path/to/output/dir/features/aapl/open.day.bin --store_type fs
 ```
 
 By default the command prints the starting date index and the shape of the
@@ -207,7 +228,7 @@ show the corresponding date for each value.  You can also supply an explicit
 calendar path:
 
 ```bash
-uv run -m featureSQL.cli view path/to/bin/file --calendar_file path/to/calendars/day.txt
+uv run -m featureSQL.cli view path/to/bin/file --calendar_file path/to/calendars/day.txt --store_type fs
 ```
 
 Internally the helper still uses `numpy.fromfile` so the Python snippet

@@ -101,7 +101,7 @@ def _get_nyse():
         return []
 
 
-def get_us_stock_symbols(reload: bool = False, data_path: Union[str, Path] = None) -> List[str]:
+def get_us_stock_symbols(reload: bool = False, data_path: Union[str, Path] = None, store=None) -> List[str]:
     """Return a list of US equity tickers.
 
     The result is cached in ``us_symbols_cache.pkl`` alongside this script so
@@ -109,24 +109,28 @@ def get_us_stock_symbols(reload: bool = False, data_path: Union[str, Path] = Non
     ``reload=True`` to re‑fetch and overwrite the cache.
     """
     global _US_SYMBOLS
+    from .storage import get_storage
 
     # memory cache short‑circuit
     if _US_SYMBOLS is not None and not reload:
         return _US_SYMBOLS
 
+    if store is None:
+        store = get_storage("fs")
+
     # build cache path using data_path if supplied
     if data_path is None:
-        cache_dir = Path(__file__).parent
+        cache_dir = store.joinpath(str(Path(__file__).parent), "source", "instruments")
     else:
-        cache_dir = Path(data_path).expanduser()
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir.joinpath("source/instruments/us_symbols.txt")
+        cache_dir = store.joinpath(str(data_path), "source", "instruments")
+        
+    store.mkdir(cache_dir, parents=True, exist_ok=True)
+    cache_file = store.joinpath(cache_dir, "us_symbols.txt")
 
     # disk cache (plain text)
-    if not reload and cache_file.exists():
+    if not reload and store.exists(cache_file):
         try:
-            with cache_file.open() as fp:
-                _US_SYMBOLS = [line.strip() for line in fp if line.strip()]
+            _US_SYMBOLS = [line.strip() for line in store.read_text(cache_file).splitlines() if line.strip()]
             return _US_SYMBOLS
         except Exception:
             logger.warning("failed to load symbol cache, refreshing")
@@ -141,8 +145,7 @@ def get_us_stock_symbols(reload: bool = False, data_path: Union[str, Path] = Non
     _US_SYMBOLS = sorted(set(map(fmt, filter(lambda x: len(x) < 8 and not x.endswith("WS"), all_syms))))
     # write cache file (plain text)
     try:
-        with cache_file.open("w") as fp:
-            fp.write("\n".join(_US_SYMBOLS))
+        store.write_text(cache_file, "\n".join(_US_SYMBOLS))
     except Exception:
         logger.warning("failed to write us symbol cache")
     return _US_SYMBOLS
@@ -220,9 +223,14 @@ class BaseCollector(abc.ABC):
         self,
         source_dir: Union[str, Path],
         symbol_list: Iterable[str] = None,
+        store=None
     ):
-        self.source_dir = Path(source_dir).expanduser()
-        self.source_dir.mkdir(parents=True, exist_ok=True)
+        from .storage import get_storage
+        self.store = store if store else get_storage("fs")
+        self.source_dir = str(source_dir)
+        if isinstance(store, type(get_storage("fs"))):
+            self.source_dir = str(Path(source_dir).expanduser())
+        self.store.mkdir(self.source_dir, parents=True, exist_ok=True)
         # preserve an *explicit* empty list/set rather than normalising it to
         # ``None``.  the distinction matters because ``None`` means “no
         # filtering” and an empty iterable should mean “filter to nothing”.
@@ -245,6 +253,7 @@ class BaseCollector(abc.ABC):
         end: str,
         delay: float = 0.5,
     ):
+        import io
         # build instrument list respecting any explicit symbol_list
         if self.symbol_list is not None:
             # user provided an explicit set; if it's empty we treat it as nothing to
@@ -264,16 +273,37 @@ class BaseCollector(abc.ABC):
 
         for symbol in instruments:
             fname = self.normalize_symbol(symbol)
-            path = self.source_dir.joinpath(f"{fname}.csv")
+            path = self.store.joinpath(self.source_dir, f"{fname}.csv")
             # skip existing file
-            if path.exists():
+            if self.store.exists(path):
                 continue
             # use yahooquery to fetch data
-            t = Ticker(symbol)
-            df = t.history(start=start, end=end, interval="1d")
+            try:
+                t = Ticker(symbol)
+                df = t.history(start=start, end=end, interval="1d")
+            except Exception as e:  # includes network timeouts, yahooquery errors
+                logger.warning(f"failed to fetch data for {symbol}: {e}, skipping")
+                time.sleep(delay)
+                continue
             if not df.empty:
                 df.reset_index(inplace=True)
-                df.to_csv(path, index=False)
+                try:
+                    # explicitly check for FileSystemStore to avoid confusion with
+                    # dynamically created instances or monkeypatching side-effects.
+                    from .storage import FileSystemStore
+                    if isinstance(self.store, FileSystemStore):
+                        df.to_csv(path, index=False)
+                    else:
+                        csv_buffer = io.StringIO()
+                        df.to_csv(csv_buffer, index=False)
+                        try:
+                            self.store.write_text(path, csv_buffer.getvalue())
+                        except Exception as e:
+                            logger.warning(f"download_data write_text exception for {symbol} path={path}: {e}")
+                            raise
+                except Exception as e:
+                    logger.warning(f"failed to write data for {symbol} ({path}): {e}, skipping")
+                    # do not re-raise; move on to next symbol
             time.sleep(delay)
 
 

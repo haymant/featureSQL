@@ -72,26 +72,42 @@ class DuckQueryService:
     # a simple regex is sufficient for the limited syntax we expect.
     SYMBOL_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z0-9_]+)\b", re.IGNORECASE)
 
-    def __init__(self, root: Path, cache: Optional[LRUCache] = None):
-        self.root = Path(root)
+    def __init__(self, root: str, cache: Optional[LRUCache] = None, store=None):
+        from .storage import get_storage
+        self.store = store if store else get_storage("fs")
+        self.root = str(root)
         self.cache = cache or LRUCache()
         self._conn = duckdb.connect()
         # try to read calendar file (optional)
-        cal_path = self.root.joinpath("calendars/day.txt")
+        cal_path = self.store.joinpath(self.root, "calendars", "day.txt")
         self._calendar: Optional[list] = None
-        if cal_path.exists():
-            self._calendar = [line.strip() for line in cal_path.read_text().splitlines() if line.strip()]
+        if self.store.exists(cal_path):
+            self._calendar = [line.strip() for line in self.store.read_text(cal_path).splitlines() if line.strip()]
 
     def _load_symbol_df(self, symbol: str) -> pd.DataFrame:
         """Read all bin files for ``symbol`` and return a DataFrame."""
-        symbol_dir = self.root.joinpath("features", symbol.lower())
-        if not symbol_dir.exists():
-            raise FileNotFoundError(f"symbol directory not found: {symbol_dir}")
+        symbol_dir = self.store.joinpath(self.root, "features", symbol.lower())
+        if not self.store.exists(symbol_dir) and getattr(self.store, 'store_type', 'fs') == 'fs':
+            # Note: For GCS, exists on a directory might be false if no object exactly matches the dir name
+            # So we just proceed to glob
+            pass
+
+        # normalize for glob: remove any leading slash which confuses
+        # object-storage backends.  file system paths should be left alone.
+        if isinstance(self.store, __import__('featureSQL.storage', fromlist=['FileSystemStore']).FileSystemStore):
+            glob_path = symbol_dir
+        else:
+            glob_path = symbol_dir.lstrip("/") if isinstance(symbol_dir, str) else symbol_dir
 
         cols: Dict[str, np.ndarray] = {}
-        for binfile in symbol_dir.glob("*.day.bin"):
-            field = binfile.stem.replace(".day", "")
-            arr = np.fromfile(binfile, dtype="<f")
+        for binfile in self.store.glob(glob_path, "*.day.bin"):
+            field = str(binfile).split("/")[-1].replace(".day.bin", "")
+            
+            if isinstance(self.store, __import__('featureSQL.storage', fromlist=['FileSystemStore']).FileSystemStore):
+                arr = np.fromfile(binfile, dtype="<f")
+            else:
+                arr = np.frombuffer(self.store.read_bytes(binfile), dtype="<f")
+                
             if arr.size == 0:
                 continue
             # first element is date index; convert to calendar date if available
@@ -100,6 +116,10 @@ class DuckQueryService:
                 # produce a date column if not already
                 cols.setdefault("date", pd.Series([self._calendar[int(arr[0]) + i] for i in range(len(data))]))
             cols[field] = data
+            
+        if not cols:
+            raise FileNotFoundError(f"symbol directory/files not found or empty: {symbol_dir}")
+            
         return pd.DataFrame(cols)
 
     def _ensure_symbols(self, sql: str) -> None:
