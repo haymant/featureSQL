@@ -155,6 +155,25 @@ def test_update_mode_skips_old_range(tmp_path):
     assert mtime2 == mtime1  # file untouched
 
 
+def test_symbols_file_multi_column(tmp_path):
+    """If a symbols file has extra columns, only the first column is used."""
+    symfile = tmp_path / "symbols.txt"
+    symfile.write_text("AAPL,ignore\nTSLA other\nGOOG\n")
+    data_dir = tmp_path / "data"
+    r = Run()
+    r.download(
+        region="US",
+        start="2020-01-01",
+        end="2020-01-02",
+        symbols_file=str(symfile),
+        data_path=str(data_dir),
+        store_type="fs",
+    )
+    assert (data_dir / "feature-csv" / "AAPL.csv").exists()
+    assert (data_dir / "feature-csv" / "TSLA.csv").exists()
+    assert (data_dir / "feature-csv" / "GOOG.csv").exists()
+
+
 def test_skip_symbol_on_yahoo_error(tmp_path, monkeypatch):
     """If fetching from Yahoo fails for a symbol we skip it and continue."""
     # replace Ticker class with one that raises for TSLA

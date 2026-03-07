@@ -41,15 +41,25 @@ class Run:
         sym_list = None
         if symbols_file:
             path = symbols_file
+            def parse_lines(text: str):
+                out = []
+                for ln in text.splitlines():
+                    if not ln.strip():
+                        continue
+                    # take first token separated by comma or whitespace
+                    first = __import__("re").split(r"[,\s]+", ln.strip())[0]
+                    out.append(first.upper())
+                return out
+
             if store_type == "fs":
                 path_obj = Path(symbols_file).expanduser()
                 if path_obj.exists():
-                    sym_list = [s.strip().upper() for s in path_obj.read_text().splitlines() if s.strip()]
+                    sym_list = parse_lines(path_obj.read_text())
                 else:
                     logger.warning(f"symbols_file {path} does not exist")
             else:
                 if store.exists(path):
-                    sym_list = [s.strip().upper() for s in store.read_text(path).splitlines() if s.strip()]
+                    sym_list = parse_lines(store.read_text(path))
                 else:
                     logger.warning(f"symbols_file {path} does not exist in {store_type}")
 
