@@ -269,7 +269,29 @@ class DumpDataBase:
     def _get_source_data(self, file_path: str) -> pd.DataFrame:
         df = read_as_df(file_path, store=self.store, low_memory=False)
         if self.date_field_name in df.columns:
-            df[self.date_field_name] = pd.to_datetime(df[self.date_field_name])
+            # ensure string type and trim whitespace before parsing
+            series = df[self.date_field_name].astype(str).str.strip()
+            # allow mixed/ISO formats and coerce errors so that malformed rows
+            # don't raise exceptions during parallel execution.  This is the
+            # root cause of the ``unconverted data remains`` error seen when
+            # a value was just ``" 09:30:00-04:00"`` rather than a full date.
+            # After parsing drop timezone information so that downstream
+            # comparisons between files are consistent (naive timestamps).
+            series = pd.to_datetime(
+                series,
+                errors="coerce",
+                utc=True,
+            )
+            if hasattr(series.dt, "tz") and series.dt.tz is not None:
+                # remove tz information; utc=True above means values are in UTC
+                try:
+                    series = series.dt.tz_convert(None)
+                except Exception:
+                    # if tz_convert fails for any reason fall back to localize
+                    series = series.dt.tz_localize(None)
+            df[self.date_field_name] = series
+            # drop rows that could not be parsed at all
+            df = df.dropna(subset=[self.date_field_name])
         # df.drop_duplicates([self.date_field_name], inplace=True)
         return df
 
@@ -393,9 +415,17 @@ class DumpDataBase:
         # used when creating a bin file
         date_index = self.get_datetime_index(_df, calendar_list)
         for field in self.get_dump_fields(_df.columns):
-            bin_path = self.store.joinpath(features_dir, f"{field.lower()}.{self.freq}{self.DUMP_FILE_SUFFIX}")
+            # only numeric columns can be stored in the binary format;
+            # symbol/date fields and other strings are skipped quietly.  this
+            # mirrors the behaviour when the user passes ``--exclude_fields``
+            # explicitly, but makes the API safer when defaults are used.
             if field not in _df.columns:
                 continue
+            if not pd.api.types.is_numeric_dtype(_df[field]):
+                logger.warning(f"skipping non-numeric field '{field}' for {code}")
+                continue
+
+            bin_path = self.store.joinpath(features_dir, f"{field.lower()}.{self.freq}{self.DUMP_FILE_SUFFIX}")
             if self.store.exists(bin_path) and self._mode == self.UPDATE_MODE:
                 # update
                 if self.store_type == "fs":

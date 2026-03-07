@@ -96,6 +96,35 @@ def test_csv_then_dump_all(tmp_path):
     assert (data_dir / "features" / "aapl" / "open.day.bin").exists()
 
 
+def test_dump_all_handles_malformed_dates(tmp_path):
+    """A malformed or offset-aware date should not crash dump_all.
+
+    This exercise reproduces the error seen when one of the rows contained
+    only a time component such as ``" 09:30:00-04:00"``.  The parser now
+    coerces invalid values and drops them rather than blowing up in the
+    worker process.
+    """
+    data_dir = tmp_path / "data"
+    feature = data_dir / "feature-csv"
+    feature.mkdir(parents=True)
+    # create CSV with a valid UTC offset and one bad row
+    bad_csv = feature / "AAPL.csv"
+    bad_csv.write_text(
+        "symbol,date,open\n"
+        "AAPL,2020-01-01 09:30:00-04:00,1.0\n"
+        "AAPL, 09:30:00-04:00,2.0\n"
+    )
+
+    dumper = DumpDataAll(data_path=str(feature), dump_dir=str(data_dir), max_workers=1)
+    # should complete without raising
+    dumper.dump()
+
+    # only the valid date should appear in the calendar file
+    cal = pd.read_csv(data_dir / "calendars" / "day.txt", header=None)[0].tolist()
+    assert len(cal) == 1
+    assert "2020-01-01" in cal
+
+
 def test_direct_bin_after_reset(tmp_path):
     """Resetting the output and downloading directly to bin should work."""
     data_dir = tmp_path / "data"

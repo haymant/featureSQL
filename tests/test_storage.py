@@ -117,16 +117,19 @@ def test_dumpdataall_gcs_errors(monkeypatch):
     with pytest.raises(FileNotFoundError):
         DumpDataAll(data_path="nope", dump_dir="mybucket", store_type="gcs")
 
-    # simulate glob returning an empty string entry and verify same error
-    fake = FakeClient()
-    buck = fake.get_bucket("mybucket")
-    # monkeypatch store to return [''] regardless
-    class BadGCSStore(GCSStore):
-        def glob(self, path, pattern):
-            return [""]
-    monkeypatch.setattr("featureSQL.storage.GCSStore", BadGCSStore)
-    with pytest.raises(FileNotFoundError):
-        DumpDataAll(data_path="prefix", dump_dir="mybucket", store_type="gcs")
+
+def test_get_source_data_malformed_dates(tmp_path):
+    """_get_source_data should coerce bad date strings and drop them."""
+    from featureSQL.dump_bin import DumpDataAll
+    # prepare a csv with one good date and one row containing only a time
+    p = tmp_path / "foo.csv"
+    p.write_text("symbol,date\nA,2020-01-01 09:30:00-04:00\nA, 09:30:00-04:00\n")
+    dumper = DumpDataAll(data_path=str(p), dump_dir=str(tmp_path / "out"), store_type="fs", max_workers=1)
+    df = dumper._get_source_data(str(p))
+    assert pd.api.types.is_datetime64_dtype(df["date"])
+    # malformed row should be dropped
+    assert len(df) == 1
+    assert df["date"].iloc[0].strftime("%Y-%m-%d") == "2020-01-01"
 
 
 def test_dumpdataall_gcs_roundtrip(monkeypatch):

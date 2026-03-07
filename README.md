@@ -90,6 +90,14 @@ uv run -m featureSQL.dump_bin dump_all \
     --exclude_fields symbol,date \
     --store_type fs         # don’t try to treat metadata as floats.
 # (./source/ is /path/to/output/dir/)
+
+> ⛑️ **Note:** recent releases automatically coerce a broad range of
+> timestamp strings (including ISO‑8601 offsets) when building the
+> calendar.  Invalid or malformed dates are dropped rather than causing a
+> crash.  Additionally, the dumper now skips any non‑numeric columns
+> (e.g. `symbol` or `date`) instead of trying to encode them, so you
+> usually don’t need to provide `--exclude_fields` unless you want to
+> explicitly whittle down the feature set.
 ```
 
 After the command finishes you’ll have a structure like:
