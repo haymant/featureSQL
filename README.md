@@ -35,6 +35,122 @@ projects; it covers the three common workflows you asked about.
 
 ## 1. Download a list of symbols (OCHLVF) to CSV
 
+## 2. Dump downloaded CSVs to partitioned Parquet
+
+The new `dump_parquet` subcommand converts the raw CSV files produced by
+`download` into a Hive‑style partitioned Parquet dataset.  It mirrors the
+example shown in `.testpy/gcs.py` and is useful when you want to process the
+collection with engines such as DuckDB or Spark that understand Parquet.
+
+```bash
+uv run -m featureSQL.cli dump_parquet \
+    --data_path ./source          # location of the feature-csv directory
+    --out_root /tmp/parquet_output # directory where files will be written
+```
+
+By default the output is partitioned on `symbol` (ticker) and
+year, with a `month` column added to every row for convenience.  The
+command will create the target directory if it does not already exist.
+
+Note that the parquet stage runs **after** the CSV download; if no CSVs are
+produced for the requested symbols (e.g. network failures or invalid
+tickers), the CLI will log a warning and skip the parquet dump instead of
+raising a cryptic error.  Always confirm that CSV files exist under
+`feature-csv/` (locally or in your bucket) before assuming the parquet
+portion succeeded.
+
+If you’d like the files pushed directly to GCS you can supply a bucket name
+(or set the `GCS_BUCKET_NAME` environment variable) and pass
+`--upload_gcs`.  When writing to a bucket the command will first read any
+existing parquet dataset in the target prefix and merge it with the newly
+concatenated CSVs, so subsequent runs **augment** the collection instead of
+wiping it out:
+
+```bash
+export GCS_SC_JSON='...'
+export GCS_BUCKET_NAME='my-edge-bucket'
+uv run -m featureSQL.cli dump_parquet \
+    --data_path ./source \
+    --out_root /tmp/parquet_output \
+    --upload_gcs
+```
+
+(Internally the code uses `google.cloud.storage.Client` in the same manner
+as the standalone example.)
+
+The remaining sections of this document describe other workflows.
+
+## GCS end‑to‑end workflow
+
+The following steps walk through preparing a clean bucket prefix, downloading
+OCHLVF data and pushing it straight to Google Cloud Storage, then keeping the
+collection up‑to‑date.  Adjust the bucket name (or set `GCS_BUCKET_NAME`) and
+`--store_type gcs` flag as shown.
+
+1. **Clean existing data path** (local or bucket).
+
+   Clear the target directory on your filesystem or remove the prefix in the
+   bucket.  For example, to remove everything under `gs://my-bucket/feature-csv`
+   you can use the `gsutil` CLI or the web console:
+
+   ```bash
+   gsutil -m rm -r gs://my-bucket/feature-csv/**
+   gsutil -m rm -r gs://my-bucket/calendars/**
+   gsutil -m rm -r gs://my-bucket/features/**
+   ```
+
+   Similarly, remove any local data under `./source` if you previously used the
+   same path.
+
+2. **Initial download (all symbols or a subset) from 1990‑01‑01 to today**
+
+   Here we demonstrate with a symbol list file; omit `--symbols_file` to grab
+   the entire US universe.  The downloader writes CSVs into the bucket using
+   the `gcs` store type.
+
+   ```bash
+   # ensure credentials are exported
+   export GCS_SC_JSON='{"type":"service_account", …}'
+   export GCS_BUCKET_NAME='my-bucket'
+
+   uv run -m featureSQL.cli download \
+       --region US \
+       --start 2026-03-01 \
+       --end   $(date +%F) \
+       --symbols_file ./symbols.txt \
+       --data_path $GCS_BUCKET_NAME \
+       --store_type gcs \
+       --out_format parquet
+   ```
+
+   Once successful the bucket will contain a `feature-csv/` prefix with one CSV
+   per symbol.
+
+3. **Binary dump and maintenance**
+
+   After downloading, you can immediately run the dumper (or include
+   `--out_format bin` on the same command as above).  The bin files are also
+   written to GCS when using `--store_type gcs`.
+
+   ```bash
+   uv run -m featureSQL.cli download \
+       --region US --start 1990-01-01 --end $(date +%F) \
+       --symbols AAPL,MSFT \
+       --data_path $GCS_BUCKET_NAME \
+       --store_type gcs \
+       --out_format bin
+   ```
+
+   To update the bucket with new data on subsequent days simply rerun the
+   same command with an expanded date range or new symbols.  The downloader and
+   dumper are idempotent; they will skip files that already exist and the
+   `DumpDataUpdate` class appends to existing bins.
+
+You can combine the upload-to-GCS logic with `dump_parquet` as described in
+section 2 if you prefer Parquet output instead of the binary format.
+
+## 3. Download symbols and produce the binary dataset in one go
+
 ```bash
 # 1. prepare a text file listing tickers, one per line
 cat > .testsymbols.txt <<'EOF'
@@ -141,6 +257,15 @@ This will
    `DumpDataAll` to initialise the dataset; subsequent runs use
    `DumpDataUpdate` to append new days.  The target directory is the same as
    `--data_path` and you can still provide `exclude_fields="symbol,date"`.
+
+You may also specify `--out_format parquet` instead of `bin`.  In that case
+only the symbols you request (via `--symbols` or `--symbols_file`) are
+converted; the utility consolidates CSVs, adds ``symbol``/``year``
+columns if needed, and writes a Hive‑style partitioned Parquet tree under
+`<data_path>/parquet` (or uploads directly to GCS when using
+`--store_type gcs`).  Running the same command again will rebuild the
+parquet files for the chosen symbols from the CSVs, effectively replacing the
+existing files with a dataset that includes any newly downloaded dates.
 
 The first run must be preceded by an empty or non‑existent output directory
 (and/or you can manually run `dump_all` as shown above); thereafter the

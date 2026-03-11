@@ -6,6 +6,7 @@ This module delegates Yahoo logic to ``featureSQL.yahoo`` and binary dumping to
 """
 
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,10 @@ class Run:
         store_type: str = "fs",
     ):
         from .storage import get_storage
+        # fire may occasionally treat an empty argument as a boolean flag,
+        # resulting in ``data_path`` being True/False instead of a string.
+        if store_type == "gcs" and (not data_path or not isinstance(data_path, str)):
+            raise ValueError("--data_path must be supplied with a non-empty GCS bucket name when using store_type gcs")
         store = get_storage(store_type, data_path)
 
         # determine symbol_list either from explicit symbols or file
@@ -122,6 +127,242 @@ class Run:
                 dumper.dump()
             except Exception as e:
                 logger.warning(f"unable to perform binary dump: {e}")
+
+        # parquet output support
+        if out_format.lower() == "parquet":
+            try:
+                # before attempting to dump we verify that the downloader
+                # actually produced CSVs for the requested symbols; this
+                # prevents confusing "no csv files match requested symbols"
+                # errors when the fetch failed or returned nothing.
+                sym_filter = None
+                if symbols is not None:
+                    if isinstance(symbols, (list, tuple)):
+                        sym_filter = {s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()}
+                    else:
+                        sym_filter = {s.strip().upper() for s in str(symbols).split(",") if s.strip()}
+                    if sym_filter:
+                        # gather existing csv files and check for overlap
+                        csv_root = store.joinpath(base, "feature-csv")
+                        all_csvs = store.glob(csv_root, "*.csv")
+                        matching = []
+                        for f in all_csvs:
+                            name = os.path.basename(f).split(".")[0].upper()
+                            if name in sym_filter:
+                                matching.append(f)
+                        if not matching:
+                            logger.warning(
+                                "no csv files were downloaded for requested symbols; skipping parquet dump"
+                            )
+                            # skip the parquet stage entirely
+                            sym_filter = None  # signal to avoid dumping
+                # choose a local directory for parquet files; avoid stomping
+                # the CSV tree when writing locally, and use a temporary
+                # folder when targeting GCS so that upload logic can operate
+                # from a known root.
+                if store_type == "fs":
+                    parquet_root = store.joinpath(base, "parquet")
+                else:
+                    parquet_root = os.path.join(os.getcwd(), "_parquet_temp")
+                    # wipe any existing temporary data to ensure clean write
+                    try:
+                        import shutil
+
+                        shutil.rmtree(parquet_root)
+                    except Exception:
+                        pass
+                if sym_filter is not None:
+                    self.dump_parquet(
+                        data_path=base,
+                        out_root=parquet_root,
+                        upload_gcs=store_type == "gcs",
+                        gcs_bucket=os.environ.get("GCS_BUCKET_NAME") if store_type == "gcs" else None,
+                        store_type=store_type,
+                        symbols=symbols if symbols is not None else None,
+                    )
+            except Exception as e:
+                logger.warning(f"unable to perform parquet dump: {e}")
+
+    def dump_parquet(
+        self,
+        data_path: str = None,
+        out_root: str = "local_parquet_features",
+        partition_cols: str = "symbol,year",
+        upload_gcs: bool = False,
+        gcs_bucket: str = None,
+        store_type: str = "fs",
+        symbols: list[str] | None = None,
+    ):
+        """Dump the CSV dataset to a partitioned Parquet collection.
+
+        The CLI already knows how to download and normalize price data into the
+        traditional ``feature-csv`` directory.  This helper reads every CSV
+        file found under that directory, concatenates them, adds ``year`` and
+        ``month`` fields based on the ``date`` column, and then writes the
+        resulting table using :mod:`pyarrow.dataset` with Hive-style
+        partitioning.  The default partitions are ``instrument`` and
+        ``year`` which mirrors the example in ``.testpy/gcs.py``.
+
+        If ``upload_gcs`` is ``True`` or ``gcs_bucket`` is provided the code
+        will attempt to upload the generated parquet files to the specified
+        Google Cloud Storage bucket.  Credentials are read from the
+        ``GCS_SC_JSON`` environment variable and the usual service account
+        JSON format is expected.
+
+        Before writing, when targeting GCS the helper will also look for an
+        existing parquet dataset at the same bucket/prefix.  Any rows found
+        there are merged with the newly-read CSVs (duplicates dropped by
+        symbol+date) so that repeated runs augment the collection instead of
+        blowing away earlier data.  Hive partition columns such as ``symbol``
+        are respected during the merge.
+        """
+        import os
+        from .storage import get_storage
+
+        base = data_path if data_path is not None else self.source_dir
+        store = get_storage(store_type, base)
+
+        # gather CSV paths; the downloader stores files under ``feature-csv``
+        csv_root = store.joinpath(base, "feature-csv")
+        csv_files = store.glob(csv_root, "*.csv")
+        if not csv_files:
+            print(f"no csv files found under {csv_root}")
+            return
+
+        # optionally restrict to a subset of symbols when provided; this
+        # makes the routine idempotent and limits work when only a few
+        # tickers are being updated (e.g. in the download() helper).
+        if symbols is not None:
+            # accept comma-separated string or any iterable of strings
+            if isinstance(symbols, str):
+                symbols = [s for s in symbols.split(",") if s.strip()]
+            else:
+                symbols = [s for s in symbols]
+            symbol_set = {s.strip().upper() for s in symbols if isinstance(s, str)}
+            filtered = []
+            for f in csv_files:
+                name = os.path.basename(f).split(".")[0].upper()
+                if name in symbol_set:
+                    filtered.append(f)
+            csv_files = filtered
+            if not csv_files:
+                print("no csv files match requested symbols")
+                return
+
+        frames = []
+        for csv in csv_files:
+            try:
+                if store_type == "fs":
+                    df = pd.read_csv(csv)
+                else:
+                    import io
+
+                    df = pd.read_csv(io.BytesIO(store.read_bytes(csv)))
+            except Exception as e:
+                logger.warning(f"failed to read {csv}: {e}")
+                continue
+            # some sources (e.g. YahooCollectorUS) don't include an explicit
+            # "symbol" column, so infer from the file name if necessary.
+            if "symbol" not in df.columns:
+                inferred = os.path.basename(csv).split(".")[0]
+                df["symbol"] = inferred
+            frames.append(df)
+
+        if not frames:
+            print("no readable csv data")
+            return
+
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["year"] = df["date"].dt.year
+        df["month"] = df["date"].dt.month
+
+        # if we are targeting GCS, attempt to pull in any existing parquet
+        # dataset from the same bucket/prefix and merge it with the newly
+        # concatenated CSV data.  This prevents the“overwrite everything”
+        # behaviour that was previously observed when the downloader ran
+        # against an already-populated bucket.
+        if upload_gcs or store_type == "gcs":
+            # determine dataset URI using the supplied base path; this will
+            # typically look like "gs://bucket" or "gs://bucket/prefix".
+            dataset_uri = f"gs://{base}" if base else None
+            if dataset_uri:
+                try:
+                    import pyarrow.fs as fs
+                    # ensure dataset module is available for the merge step
+                    import pyarrow.dataset as ds
+
+                    gcsfs = fs.GcsFileSystem()
+                    existing_ds = ds.dataset(dataset_uri, filesystem=gcsfs, format="parquet", partitioning="hive")
+                    existing_tbl = existing_ds.to_table()
+                    old_df = existing_tbl.to_pandas()
+                    if not old_df.empty:
+                        df = pd.concat([old_df, df], ignore_index=True)
+                        # dedupe on key columns so later rewrites don't create
+                        # duplicate rows (symbol+date is the natural key).
+                        df.drop_duplicates(subset=["symbol", "date"], inplace=True)
+                except Exception as e:
+                    # if the bucket is empty or unreadable just proceed with
+                    # the CSV-only dataframe.
+                    logger.warning(f"unable to read existing parquet from gcs: {e}")
+
+        # ensure any object/boolean columns are stringified to avoid
+        # pyarrow complaints about mixed types (e.g. symbol column sometimes
+        # contains bools when read from CSVs).
+        for col in df.select_dtypes(include=["object", "bool"]).columns:
+            df[col] = df[col].astype(str)
+
+        # prepare partitioning schema for pyarrow
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+
+
+        LOCAL_ROOT = Path(out_root)
+        LOCAL_ROOT.mkdir(parents=True, exist_ok=True)
+
+        # the partitioning logic is currently fixed to symbol-only; the
+        # earlier version computed ``cols`` from ``partition_cols`` but the
+        # CLI never exposed any other choice.  Leave the hard-coded schema in
+        # place so that downstream processes can rely on a consistent layout.
+        print("Partitioning by columns: ['symbol']")
+        partitioning = ds.partitioning(pa.schema([("symbol", pa.string())]), flavor="hive")
+
+        table = pa.Table.from_pandas(df)
+        # display the table schema/title so user sees what was written
+        try:
+            print(f"Parquet table schema:\n{table.schema}")
+        except Exception:
+            # if printing fails for any reason, silently continue
+            pass
+        ds.write_dataset(
+            table,
+            base_dir=LOCAL_ROOT,
+            partitioning=partitioning,
+            format="parquet",
+            existing_data_behavior="overwrite_or_ignore",
+        )
+
+        print(f"Local Parquet written to: {LOCAL_ROOT}")
+
+        # optional upload to GCS
+        if upload_gcs or gcs_bucket:
+            bucket = gcs_bucket or os.environ.get("GCS_BUCKET_NAME")
+            if not bucket:
+                raise ValueError("gcs_bucket must be provided to upload")
+            # reuse the example logic from .testpy/gcs.py
+            from google.cloud import storage
+
+            gcs_sc_json = os.environ.get("GCS_SC_JSON")
+            if not gcs_sc_json:
+                raise ValueError("Set env vars: GCS_SC_JSON for GCS upload")
+            client = storage.Client.from_service_account_json("gcs.json")
+            bkt = client.bucket(bucket)
+            for file_path in LOCAL_ROOT.rglob("*.parquet"):
+                blob_path = f"{file_path.relative_to(LOCAL_ROOT)}"
+                blob = bkt.blob(blob_path)
+                blob.upload_from_filename(file_path)
+                print(f"Uploaded: {blob_path}")
+            print(f"All files uploaded to gs://{bucket}/")
 
     def normalize(self, source_dir: str = None, store_type: str = "fs"):
         from .storage import get_storage

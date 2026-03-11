@@ -168,13 +168,11 @@ def test_dumpdataall_gcs_roundtrip(monkeypatch):
     assert bucket.blobs["calendars/day.txt"].download_as_bytes().startswith(b"2020-01-01")
     assert "instruments/all.txt" in bucket.blobs
     # debug: list all blob keys
-    print("DEBUG all blob keys:", list(bucket.blobs.keys()))
     # also verify that the query service can read from this store
     from featureSQL.duck import DuckQueryService, LRUCache
     from featureSQL.storage import get_storage
     store = get_storage("gcs", "bucketx")
     # debug: inspect glob results
-    print("DEBUG glob features/foo ->", store.glob("features/foo", "*.day.bin"))
     svc = DuckQueryService(root="", cache=LRUCache(max_symbols=2), store=store)
     # bucket path includes features prefix since root is empty
     df = svc.execute("SELECT open FROM FOO")

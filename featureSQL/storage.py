@@ -93,6 +93,8 @@ class FileSystemStore(StorageBackend):
 class GCSStore(StorageBackend):
     def __init__(self, bucket_path: str):
         # bucket_path may include a base prefix, e.g. "mybucket" or "mybucket/some/dir"
+        if not isinstance(bucket_path, str) or not bucket_path:
+            raise ValueError(f"invalid bucket_path for GCSStore: {bucket_path!r}")
         parts = bucket_path.split("/", 1)
         self.bucket_name = parts[0]
         self.prefix = parts[1].rstrip("/") if len(parts) == 2 else ""

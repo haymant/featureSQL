@@ -7,6 +7,7 @@ retrieval, symbol lists, and the collector/normalizer classes used by the CLI.
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import Iterable, List, Union
 import abc
@@ -17,6 +18,7 @@ from loguru import logger
 from yahooquery import Ticker
 
 from .utils import deco_retry
+from .storage import get_storage, FileSystemStore
 
 
 # symbol retrieval helpers follow the same approach as the original
@@ -274,36 +276,119 @@ class BaseCollector(abc.ABC):
         for symbol in instruments:
             fname = self.normalize_symbol(symbol)
             path = self.store.joinpath(self.source_dir, f"{fname}.csv")
-            # skip existing file
-            if self.store.exists(path):
-                continue
-            # use yahooquery to fetch data
+
+            existing_df = None
+            # attempt to read existing CSV regardless of what exists() reports;
+            # a false negative should not cause data loss.  Missing-file errors
+            # are caught and ignored.
+            try:
+                if isinstance(self.store, FileSystemStore):
+                    if os.path.exists(path):
+                        existing_df = pd.read_csv(path)
+                else:
+                    # read_bytes will raise if blob does not exist
+                    import io as _io
+                    existing_df = pd.read_csv(_io.BytesIO(self.store.read_bytes(path)))
+            except Exception:
+                # most likely the file wasn't present; ignore this quietly
+                existing_df = None
+
+            # drop any leftover index column from previous runs
+            if existing_df is not None and "index" in existing_df.columns:
+                existing_df = existing_df.drop(columns=["index"])
+            # if the existing CSV mysteriously has no date column we consider it
+            # corrupt and overwrite it with fresh data.  This replicates the
+            # behaviour the user expects when rerunning downloads repeatedly.
+            if existing_df is not None and "date" not in existing_df.columns:
+                logger.warning(
+                    f"existing CSV for {symbol} missing date column, will be replaced"
+                )
+                existing_df = None
+            # convert existing dates to datetime to avoid type mismatches when
+            # concatting with new data (strings vs Timestamp cause duplicates
+            # to slip through drop_duplicates).
+            if existing_df is not None and not existing_df.empty:
+                try:
+                    existing_df["date"] = pd.to_datetime(existing_df["date"], errors="coerce")
+                except Exception:
+                    pass
+                # if CSV lacks symbol column (e.g. old runs), inject one for
+                # de-duplication; every file is per-symbol so this is safe.
+                if "symbol" not in existing_df.columns:
+                    existing_df["symbol"] = symbol
+
+            # use yahooquery to fetch data for the requested range
             try:
                 t = Ticker(symbol)
-                df = t.history(start=start, end=end, interval="1d")
+                new_df = t.history(start=start, end=end, interval="1d")
             except Exception as e:  # includes network timeouts, yahooquery errors
                 logger.warning(f"failed to fetch data for {symbol}: {e}, skipping")
                 time.sleep(delay)
                 continue
-            if not df.empty:
-                df.reset_index(inplace=True)
+
+            if new_df.empty:
+                # nothing to write; leave existing file intact
+                time.sleep(delay)
+                continue
+
+            # reset index to preserve any date/symbol levels from yahooquery
+            # (do *not* drop; the old code accidentally removed the date column)
+            new_df.reset_index(inplace=True)
+            # ensure the new data actually has a date column; if not, warn and
+            # skip writing this symbol entirely to avoid corrupting the store.
+            if "date" not in new_df.columns:
+                logger.warning(
+                    f"ticker {symbol} history returned no date column; skipping"
+                )
+                time.sleep(delay)
+                continue
+            # unify date type on new data as well
+            try:
+                new_df["date"] = pd.to_datetime(new_df["date"], errors="coerce")
+            except Exception:
+                pass
+            # if we have an existing dataframe, merge and dedupe
+            if existing_df is not None and not existing_df.empty:
                 try:
-                    # explicitly check for FileSystemStore to avoid confusion with
-                    # dynamically created instances or monkeypatching side-effects.
-                    from .storage import FileSystemStore
-                    if isinstance(self.store, FileSystemStore):
-                        df.to_csv(path, index=False)
-                    else:
-                        csv_buffer = io.StringIO()
-                        df.to_csv(csv_buffer, index=False)
-                        try:
-                            self.store.write_text(path, csv_buffer.getvalue())
-                        except Exception as e:
-                            logger.warning(f"download_data write_text exception for {symbol} path={path}: {e}")
-                            raise
+                    # ensure the incoming data has a symbol column as well;
+                    # new_df reset_index() above should already have one from
+                    # yahooquery, but normalise just in case.
+                    if "symbol" not in new_df.columns:
+                        new_df["symbol"] = symbol
+
+                    combined = pd.concat([existing_df, new_df], ignore_index=True)
+                    # dedupe on symbol+date when possible, otherwise fall back to
+                    # date-only (single-symbol file)
+                    subset = ["date"]
+                    if "symbol" in combined.columns:
+                        subset = ["symbol", "date"]
+                    combined.drop_duplicates(subset=subset, inplace=True)
+                    df_to_write = combined
                 except Exception as e:
-                    logger.warning(f"failed to write data for {symbol} ({path}): {e}, skipping")
-                    # do not re-raise; move on to next symbol
+                    logger.warning(f"failed to merge CSVs for {symbol}: {e}")
+                    df_to_write = new_df
+            else:
+                df_to_write = new_df
+
+            # drop any spontaneous index column before persisting
+            if "index" in df_to_write.columns:
+                df_to_write = df_to_write.drop(columns=["index"])
+            try:
+                # `FileSystemStore` is imported at module level; no need to import here
+                if isinstance(self.store, FileSystemStore):
+                    df_to_write.to_csv(path, index=False)
+                else:
+                    import io as _io
+                    csv_buffer = _io.StringIO()
+                    df_to_write.to_csv(csv_buffer, index=False)
+                    try:
+                        self.store.write_text(path, csv_buffer.getvalue())
+                    except Exception as e:
+                        logger.warning(f"download_data write_text exception for {symbol} path={path}: {e}")
+                        raise
+            except Exception as e:
+                logger.warning(f"failed to write data for {symbol} ({path}): {e}, skipping")
+                # do not re-raise; move on to next symbol
             time.sleep(delay)
 
 
