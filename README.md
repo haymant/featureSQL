@@ -168,16 +168,32 @@ uv run -m featureSQL.cli download \
     --end   2026-02-28 \
     --symbols_file ./.testsymbols.txt \
     --data_path ./source \
-    --store_type fs   # Output to local fs (default). Change to 'gcs' and set data_path to bucket name for GCS.
+    --store_type fs   # Output to local fs (default for explicit flag).
+                   # When no --store_type is given the CLI now defaults to
+                   # 'gcs' and will use the bucket named by the
+                   # GCS_BUCKET_NAME environment variable.
 ```
 
-> **GCS setup:** when using `--store_type gcs` you must configure two
-> environment variables before running any commands or tests:
+> **GCS setup:** when using `--store_type gcs` you must configure a
+> target bucket name and some form of credentials before running any
+> commands or tests.  One of the following authentication methods is
+> supported:
 >
-> ```bash
-> export GCS_SC_JSON='{"type":"service_account", …}'    # credentials
-> export GCS_BUCKET_NAME='your-bucket-name'               # target bucket
-> ```
+> 1. **Service account JSON** – store the contents of a service account
+>    file in the `GCS_SC_JSON` environment variable.  The JSON should look
+>    like the file you normally download from Google Cloud Console.  This
+>    is the legacy mechanism and continues to work unchanged.
+>
+> 2. **HMAC key pair** – set `GCS_KEY_ID` and `GCS_KEY_SECRET` to a Google
+>    Cloud HMAC key and secret.  This is convenient for lightweight
+>    environments (e.g. CI runners) where a full service account file is
+>    inconvenient.  The helper will automatically switch to the HMAC
+>    backend when both values are present.
+>
+> In either case supply the bucket via `GCS_BUCKET_NAME`.  The unit tests
+> will skip network-dependent scenarios if the bucket name is unset, and
+> they mock the client in other cases.  However, any manual invocation
+> against a real bucket requires both variables to be correctly configured.
 >
 > The unit tests will skip network‑dependent scenarios if `GCS_BUCKET_NAME`
 > is unset, and they mock the client in other cases.  However, any manual
@@ -205,6 +221,7 @@ uv run -m featureSQL.dump_bin dump_all \
     --dump_dir   ./source/ \
     --exclude_fields symbol,date \
     --store_type fs         # don’t try to treat metadata as floats.
+    # when invoking without any store_type the default is now 'gcs'
 # (./source/ is /path/to/output/dir/)
 
 > ⛑️ **Note:** recent releases automatically coerce a broad range of
@@ -294,6 +311,7 @@ uv run -m featureSQL.cli query \
     --max_symbols 100 \
     --max_memory 2000000000 \
     --store_type fs \
+# (or leave off the flag to default to your configured GCS bucket)
     "select date, open, close, high, low, volume, adjclose from AAPL where volume > 1000000"
 ```
 

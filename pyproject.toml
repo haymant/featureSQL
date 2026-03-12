@@ -13,6 +13,7 @@ dependencies = [
     "pytest>=9.0.2",
     "twine>=6.2.0",
     "yahooquery>=2.4.1",
+    "yfinance>=0.2.54",
     "duckdb-extension-httpfs>=1.0.3",
     "fsspec>=2026.2.0",
     "gcsfs>=2026.2.0",

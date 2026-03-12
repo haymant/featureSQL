@@ -14,7 +14,19 @@ from loguru import logger
 import fire
 
 # import the yahoo helpers/collectors
-from .yahoo import YahooCollectorUS, YahooNormalize, get_us_stock_symbols
+from .ir import boost_ir_curve as build_ir_curve
+from .volsurface import calibrate_vol_surface as build_vol_surface
+from .yahoo import (
+    YahooCollectorUS,
+    YahooCollectorFX,
+    YahooCollectorIR,
+    YahooCollectorVol,
+    YahooCorrelationCollector,
+    YahooOptionChainCollector,
+    YahooNormalize,
+    get_default_symbols,
+    get_us_stock_symbols,
+)
 
 
 # simple CLI using fire
@@ -22,6 +34,68 @@ from .yahoo import YahooCollectorUS, YahooNormalize, get_us_stock_symbols
 class Run:
     def __init__(self, source_dir="./source"):
         self.source_dir = source_dir
+
+    @staticmethod
+    def _parse_symbols_text(text: str, asset_type: str = "equity"):
+        asset_key = str(asset_type or "equity").strip().lower()
+        out = []
+        for ln in text.splitlines():
+            line = ln.strip()
+            if not line:
+                continue
+            if asset_key == "correlation":
+                token = line.split()[0]
+                if "," in token and ":" not in token and "|" not in token:
+                    parts = [part.strip().upper() for part in token.split(",") if part.strip()]
+                    if len(parts) >= 2:
+                        out.append(f"{parts[0]}:{parts[1]}")
+                        continue
+                out.append(token.replace("|", ":").upper())
+            else:
+                first = __import__("re").split(r"[,\s]+", line)[0]
+                out.append(first.upper())
+        return out
+
+    @staticmethod
+    def _parse_symbols_arg(symbols, asset_type: str = "equity"):
+        if not symbols:
+            return None
+        asset_key = str(asset_type or "equity").strip().lower()
+        if isinstance(symbols, (list, tuple)):
+            raw = [s for s in symbols if isinstance(s, str) and s.strip()]
+        else:
+            separator = ";" if asset_key == "correlation" else ","
+            raw = [s for s in str(symbols).split(separator) if s.strip()]
+        if asset_key == "correlation":
+            return [s.strip().replace("|", ":").upper() for s in raw]
+        return [s.strip().upper() for s in raw]
+
+    @staticmethod
+    def _load_frames_from_path(store, path: str, store_type: str = "fs") -> pd.DataFrame:
+        if store_type == "fs":
+            path_obj = Path(path).expanduser()
+            files = [path_obj] if path_obj.is_file() else sorted(path_obj.glob("*.csv"))
+            frames = [pd.read_csv(file_path) for file_path in files]
+        else:
+            files = [path] if path.endswith(".csv") else store.glob(path, "*.csv")
+            frames = [pd.read_csv(__import__("io").BytesIO(store.read_bytes(file_path))) for file_path in files]
+        if not frames:
+            raise FileNotFoundError(f"no CSV files found under {path}")
+        return pd.concat(frames, ignore_index=True)
+
+    def _resolve_collector(self, asset_type: str, csv_dir: str, symbol_list, store):
+        asset_key = str(asset_type or "equity").strip().lower()
+        collectors = {
+            "equity": YahooCollectorUS,
+            "fx": YahooCollectorFX,
+            "ir": YahooCollectorIR,
+            "vol": YahooCollectorVol,
+            "correlation": YahooCorrelationCollector,
+            "option": YahooOptionChainCollector,
+        }
+        if asset_key not in collectors:
+            raise ValueError(f"asset_type not supported: {asset_type}")
+        return collectors[asset_key](str(csv_dir), symbol_list=symbol_list, store=store)
 
     def download(
         self,
@@ -33,38 +107,52 @@ class Run:
         reload_symbols: bool = False,
         data_path: str = None,
         out_format: str = "csv",
-        store_type: str = "fs",
-    ):
+        store_type: str = "gcs",
+        asset_type: str = "equity",
+        mode: str = "history",
+        correlation_window: int = 20,
+    ) -> dict[str, list[str]]:
+        """Download market data and return a summary of any warnings.
+
+        By default we now target Google Cloud Storage ("gcs") so that
+        downloads automatically populate the configured bucket.  Callers
+        can still override with ``store_type='fs'`` or supply an explicit
+        ``--store_type`` flag.
+
+        The existing CLI simply wrote files and returned ``None``.  To give
+        callers (such as the duck-server service) the ability to present
+        informative messages back to the user when part of the sync failed
+        (e.g. option chain rate‑limited) we now collect warning strings and
+        return them in a dict under the key ``warnings``.  The dict is
+        intentionally minimal so that existing code which ignores the return
+        value will continue to work.
+        """
+        warnings: list[str] = []
         from .storage import get_storage
         # fire may occasionally treat an empty argument as a boolean flag,
         # resulting in ``data_path`` being True/False instead of a string.
-        if store_type == "gcs" and (not data_path or not isinstance(data_path, str)):
-            raise ValueError("--data_path must be supplied with a non-empty GCS bucket name when using store_type gcs")
+        if store_type == "gcs":
+            # allow a bucket name to be supplied via environment variable
+            if not data_path or not isinstance(data_path, str):
+                data_path = os.environ.get("GCS_BUCKET_NAME")
+            if not data_path or not isinstance(data_path, str):
+                raise ValueError("--data_path must be supplied with a non-empty GCS bucket name when using store_type gcs (or set GCS_BUCKET_NAME)")
         store = get_storage(store_type, data_path)
+        asset_key = str(asset_type or "equity").strip().lower()
 
         # determine symbol_list either from explicit symbols or file
         sym_list = None
         if symbols_file:
             path = symbols_file
-            def parse_lines(text: str):
-                out = []
-                for ln in text.splitlines():
-                    if not ln.strip():
-                        continue
-                    # take first token separated by comma or whitespace
-                    first = __import__("re").split(r"[,\s]+", ln.strip())[0]
-                    out.append(first.upper())
-                return out
-
             if store_type == "fs":
                 path_obj = Path(symbols_file).expanduser()
                 if path_obj.exists():
-                    sym_list = parse_lines(path_obj.read_text())
+                    sym_list = self._parse_symbols_text(path_obj.read_text(), asset_type=asset_key)
                 else:
                     logger.warning(f"symbols_file {path} does not exist")
             else:
                 if store.exists(path):
-                    sym_list = parse_lines(store.read_text(path))
+                    sym_list = self._parse_symbols_text(store.read_text(path), asset_type=asset_key)
                 else:
                     logger.warning(f"symbols_file {path} does not exist in {store_type}")
 
@@ -74,30 +162,39 @@ class Run:
             if reload_symbols or sym_list is None:
                 # fetch fresh and optionally write back (only if explicitly
                 # requested via reload_symbols)
-                sym_list = get_us_stock_symbols(reload=True, data_path=data_path, store=store)
+                if asset_key == "equity":
+                    sym_list = get_us_stock_symbols(reload=True, data_path=data_path, store=store)
+                else:
+                    sym_list = get_default_symbols(asset_key)
                 try:
                     store.write_text(path, "\n".join(sym_list))
                 except Exception:
                     logger.warning(f"could not write symbol file {path}")
         elif symbols:
-            # fire may give us a list/tuple, or a comma string
-            if isinstance(symbols, (list, tuple)):
-                sym_list = [s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()]
-            else:
-                sym_list = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
+            sym_list = self._parse_symbols_arg(symbols, asset_type=asset_key)
+        elif reload_symbols and asset_key == "equity":
+            sym_list = get_us_stock_symbols(reload=True, data_path=data_path, store=store)
 
         # if the caller passed a data_path we use that as the base;
         # otherwise fall back to the configured source directory.  the
         # storage backend will interpret the base string appropriately (e.g.
         # a bucket name/prefix for GCS).
         base = data_path if data_path is not None else self.source_dir
-        csv_dir = store.joinpath(base, "feature-csv")
-
-        if region.upper() == "US":
-            collector = YahooCollectorUS(str(csv_dir), symbol_list=sym_list, store=store)
-        else:
+        if region.upper() != "US":
             raise ValueError("region not supported")
-        collector.download_data(start=start, end=end)
+        csv_dir = store.joinpath(base, "feature-csv") if asset_key == "equity" else store.joinpath(base, "feature-csv", asset_key)
+        if asset_key == "option":
+            csv_dir = store.joinpath(base, "option-chain")
+
+        collector = self._resolve_collector(asset_key, csv_dir, sym_list, store)
+        if asset_key == "correlation":
+            warnings += collector.download_data(start=start, end=end, mode=mode, window=correlation_window)
+        else:
+            warnings += collector.download_data(start=start, end=end, mode=mode)
+
+        if asset_key == "option" and out_format.lower() != "csv":
+            logger.warning("option-chain download supports csv output only; skipping post-processing")
+            return
 
         # optionally produce binary dump if requested
         if out_format.lower() in ("bin", "dump"):
@@ -137,13 +234,10 @@ class Run:
                 # errors when the fetch failed or returned nothing.
                 sym_filter = None
                 if symbols is not None:
-                    if isinstance(symbols, (list, tuple)):
-                        sym_filter = {s.strip().upper() for s in symbols if isinstance(s, str) and s.strip()}
-                    else:
-                        sym_filter = {s.strip().upper() for s in str(symbols).split(",") if s.strip()}
+                    sym_filter = set(self._parse_symbols_arg(symbols, asset_type=asset_key) or [])
                     if sym_filter:
                         # gather existing csv files and check for overlap
-                        csv_root = store.joinpath(base, "feature-csv")
+                        csv_root = csv_dir
                         all_csvs = store.glob(csv_root, "*.csv")
                         matching = []
                         for f in all_csvs:
@@ -179,6 +273,7 @@ class Run:
                         gcs_bucket=os.environ.get("GCS_BUCKET_NAME") if store_type == "gcs" else None,
                         store_type=store_type,
                         symbols=symbols if symbols is not None else None,
+                        csv_subdir="feature-csv" if asset_key == "equity" else f"feature-csv/{asset_key}",
                     )
             except Exception as e:
                 logger.warning(f"unable to perform parquet dump: {e}")
@@ -192,7 +287,11 @@ class Run:
         gcs_bucket: str = None,
         store_type: str = "fs",
         symbols: list[str] | None = None,
+        csv_subdir: str = "feature-csv",
     ):
+        # warnings mirrors the behaviour of `download` so callers can
+        # observe any non-fatal issues such as read failures.
+        warnings: list[str] = []
         """Dump the CSV dataset to a partitioned Parquet collection.
 
         The CLI already knows how to download and normalize price data into the
@@ -223,7 +322,7 @@ class Run:
         store = get_storage(store_type, base)
 
         # gather CSV paths; the downloader stores files under ``feature-csv``
-        csv_root = store.joinpath(base, "feature-csv")
+        csv_root = store.joinpath(base, csv_subdir)
         csv_files = store.glob(csv_root, "*.csv")
         if not csv_files:
             print(f"no csv files found under {csv_root}")
@@ -309,7 +408,7 @@ class Run:
         # ensure any object/boolean columns are stringified to avoid
         # pyarrow complaints about mixed types (e.g. symbol column sometimes
         # contains bools when read from CSVs).
-        for col in df.select_dtypes(include=["object", "bool"]).columns:
+        for col in df.select_dtypes(include=["object", "string", "bool"]).columns:
             df[col] = df[col].astype(str)
 
         # prepare partitioning schema for pyarrow
@@ -344,25 +443,92 @@ class Run:
 
         print(f"Local Parquet written to: {LOCAL_ROOT}")
 
-        # optional upload to GCS
+        # optional upload to GCS or other supported object stores.
+        # Instead of using the low-level google client (which required a
+        # local JSON file path), reuse the existing `get_storage` helper so
+        # the same credential logic used by the downloader/storage backend
+        # applies here.  This also makes testing easier.
         if upload_gcs or gcs_bucket:
             bucket = gcs_bucket or os.environ.get("GCS_BUCKET_NAME")
             if not bucket:
                 raise ValueError("gcs_bucket must be provided to upload")
-            # reuse the example logic from .testpy/gcs.py
-            from google.cloud import storage
+            from .storage import get_storage
 
-            gcs_sc_json = os.environ.get("GCS_SC_JSON")
-            if not gcs_sc_json:
-                raise ValueError("Set env vars: GCS_SC_JSON for GCS upload")
-            client = storage.Client.from_service_account_json("gcs.json")
-            bkt = client.bucket(bucket)
+            store = get_storage(store_type, bucket)
+            # upload every parquet file we just wrote; preserve relative paths
             for file_path in LOCAL_ROOT.rglob("*.parquet"):
-                blob_path = f"{file_path.relative_to(LOCAL_ROOT)}"
-                blob = bkt.blob(blob_path)
-                blob.upload_from_filename(file_path)
-                print(f"Uploaded: {blob_path}")
-            print(f"All files uploaded to gs://{bucket}/")
+                rel = file_path.relative_to(LOCAL_ROOT)
+                target = f"{rel}"
+                try:
+                    store.write_bytes(target, file_path.read_bytes())
+                    print(f"Uploaded: {target}")
+                except Exception as e:
+                    print(f"warning: failed to upload {target}: {e}")
+            print(f"All files uploaded to {bucket}")
+
+        # finally return any warnings accumulated during the download
+        return {"warnings": warnings}
+
+    def boost_ir_curve(
+        self,
+        input_path: str = None,
+        output_path: str = None,
+        store_type: str = "fs",
+        data_path: str = None,
+    ):
+        from .storage import get_storage
+
+        base = data_path if data_path is not None else self.source_dir
+        store = get_storage(store_type, base)
+        curve_input = input_path or store.joinpath(base, "feature-csv", "ir")
+        frame = self._load_frames_from_path(store, curve_input, store_type=store_type)
+        if "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+            frame = frame.sort_values("date").groupby("symbol", as_index=False).tail(1)
+        curve = build_ir_curve(frame)
+        if output_path:
+            if store_type == "fs":
+                Path(output_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+                curve.to_csv(output_path, index=False)
+            else:
+                store.write_text(output_path, curve.to_csv(index=False))
+        print(curve.to_string(index=False))
+        return curve
+
+    def calibrate_vol_surface(
+        self,
+        option_chain_path: str = None,
+        spot: float = None,
+        rate: float = 0.0,
+        output_path: str = None,
+        store_type: str = "fs",
+        data_path: str = None,
+    ):
+        from .storage import get_storage
+
+        base = data_path if data_path is not None else self.source_dir
+        store = get_storage(store_type, base)
+        chain_path = option_chain_path or store.joinpath(base, "option-chain")
+        chain = self._load_frames_from_path(store, chain_path, store_type=store_type)
+        inferred_spot = spot
+        if inferred_spot is None:
+            for candidate in ["regularMarketPrice", "underlyingPrice", "underlying_price"]:
+                if candidate in chain.columns:
+                    series = pd.to_numeric(chain[candidate], errors="coerce").dropna()
+                    if not series.empty:
+                        inferred_spot = float(series.iloc[-1])
+                        break
+        if inferred_spot is None:
+            raise ValueError("spot must be provided when option chain lacks underlying price columns")
+        surface = build_vol_surface(chain, spot=float(inferred_spot), rate=rate)
+        if output_path:
+            if store_type == "fs":
+                Path(output_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+                surface.to_csv(output_path, index=False)
+            else:
+                store.write_text(output_path, surface.to_csv(index=False))
+        print(surface.to_string(index=False))
+        return surface
 
     def normalize(self, source_dir: str = None, store_type: str = "fs"):
         from .storage import get_storage

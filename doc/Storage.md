@@ -38,6 +38,10 @@ A base abstract class `StorageBackend` will define the primary operations:
 ### Implementation Details
 - **`fs` (FileSystemStore)**: Wraps `pathlib.Path` and standard `os` / `pandas` methods.
 - **`gcs` (GCSStore)**: 
+  - Authentication may come from either a service‑account JSON (via the
+    `GCS_SC_JSON` environment variable) or from an HMAC key pair
+    (`GCS_KEY_ID`/`GCS_KEY_SECRET`).  The latter uses `gcsfs` under the
+    hood and is chosen whenever both key variables are present.
   - Authenticates via `$GCS_SC_JSON` environment variable containing service account credentials.
   - Treats `--data_path` as the GCS `bucket_name` or `bucket_name/prefix`.
   - Uses `google.cloud.storage.Client` to perform bucket and blob operations (e.g. `blob.upload_from_string`, `blob.download_as_bytes`, `client.list_blobs(prefix=...)`).

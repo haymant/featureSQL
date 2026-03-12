@@ -85,6 +85,75 @@ def test_gcs_store(mock_creds, mock_client, monkeypatch):
     assert txt == "hello gcs"
     mock_blob.download_as_text.assert_called()
 
+
+def test_gcs_store_hmac(monkeypatch):
+    """When HMAC key/secret variables are present the store should use gcsfs
+    instead of the google client."""
+    monkeypatch.setenv("GCS_KEY_ID", "KEYID")
+    monkeypatch.setenv("GCS_KEY_SECRET", "KEYSECRET")
+    called = {}
+    class FakeFS:
+        def __init__(self, project=None, token=None):
+            called['token'] = token
+            called['project'] = project
+        def exists(self, path):
+            return False
+    monkeypatch.setattr("gcsfs.GCSFileSystem", FakeFS)
+
+    store = get_storage(StoreType.GCS.value, "bucket123")
+    assert isinstance(store, GCSStore)
+    assert getattr(store, "use_gcsfs", False) is True
+    assert called['token']["access_key"] == "KEYID"
+    assert called['token']["secret_key"] == "KEYSECRET"
+
+def test_gcs_store_bad_json(monkeypatch):
+    """Malformed or wrong-type JSON in GCS_SC_JSON should produce a human-
+    readable ValueError rather than a raw KeyError.
+    """
+    # empty JSON is clearly not a service account blob; the initializer
+    # should catch the resulting KeyError and wrap it.
+    monkeypatch.setenv("GCS_SC_JSON", "{}")
+    with pytest.raises(ValueError) as exc:
+        GCSStore("bucket123")
+    assert "missing key" in str(exc.value)
+
+
+def test_gcs_store_json_over_hmac(monkeypatch, caplog):
+    """When both a service account JSON and HMAC creds are present the
+    store should ignore the HMAC keys and use the JSON.  A warning is logged
+    to notify about the ambiguity.
+    """
+    dummy_json = json.dumps({
+        "type": "service_account",
+        "project_id": "p",
+        "private_key_id": "abc",
+        "private_key": "key",
+        "client_email": "e@p.iam.gserviceaccount.com",
+        "client_id": "id",
+        "auth_uri": "u",
+        "token_uri": "t",
+        "auth_provider_x509_cert_url": "url",
+        "client_x509_cert_url": "url",
+    })
+    monkeypatch.setenv("GCS_SC_JSON", dummy_json)
+    monkeypatch.setenv("GCS_KEY_ID", "KEYID")
+    monkeypatch.setenv("GCS_KEY_SECRET", "KEYSECRET")
+
+    caplog.set_level(logging.WARNING)
+    # patch the google client creation to avoid real network calls
+    with patch("google.cloud.storage.Client") as mock_client:
+        mock_inst = Mock()
+        mock_inst.get_bucket.return_value = Mock()
+        mock_client.return_value = mock_inst
+
+        store = GCSStore("bucket")
+        assert isinstance(store, GCSStore)
+        # ensure we didn't switch to gcsfs
+        assert not getattr(store, "use_gcsfs", False)
+
+    assert "ignoring HMAC" in caplog.text
+
+
 def test_get_storage_invalid():
     with pytest.raises(NotImplementedError):
         get_storage("s3", "my_bucket")

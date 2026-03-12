@@ -3,6 +3,7 @@ import os
 import json
 import io
 import fnmatch
+import logging
 from enum import Enum
 from pathlib import Path
 from typing import List, Union
@@ -101,17 +102,67 @@ class GCSStore(StorageBackend):
         self._init_client()
 
     def _init_client(self):
-        from google.cloud import storage
-        from google.oauth2 import service_account
-
+        # support two authentication modes:
+        # 1. service account JSON supplied via GCS_SC_JSON (existing behaviour)
+        # 2. HMAC key/secret pair supplied via GCS_KEY_ID and GCS_KEY_SECRET
+        #    (useful when running in environments that do not support
+        #    service accounts).
+        # We support two authentication modes: HMAC key pair and service
+        # account JSON.  Historically the presence of HMAC variables would
+        # cause us to use `gcsfs.GCSFileSystem`, but this upstream library
+        # interprets *any* dict token as a credentials blob and therefore
+        # happily tried to parse our service account JSON as an OAuth token,
+        # leading to ``KeyError('refresh_token')``.  To avoid accidental
+        # mis‑configuration we now prioritise the explicit JSON credential
+        # and only fall back to HMAC when no JSON is provided.
         json_string = os.getenv("GCS_SC_JSON")
-        if not json_string:
-            raise ValueError("GCS_SC_JSON environment variable not set.")
-        
-        info = json.loads(json_string)
-        credentials = service_account.Credentials.from_service_account_info(info)
-        self.client = storage.Client(credentials=credentials, project=info.get('project_id'))
-        self.bucket = self.client.get_bucket(self.bucket_name)
+        if json_string:
+            # use service account path even if HMAC variables are also set
+            if os.getenv("GCS_KEY_ID") and os.getenv("GCS_KEY_SECRET"):
+                logging.getLogger(__name__).warning(
+                    "both GCS_SC_JSON and GCS_KEY_ID/GCS_KEY_SECRET are set; "
+                    "using service account JSON and ignoring HMAC keys"
+                )
+            from google.cloud import storage
+            from google.oauth2 import service_account
+
+            try:
+                info = json.loads(json_string)
+            except Exception as e:  # json.JSONDecodeError or similar
+                raise ValueError("GCS_SC_JSON is not valid JSON") from e
+
+            try:
+                credentials = service_account.Credentials.from_service_account_info(info)
+            except KeyError as e:
+                raise ValueError(
+                    f"invalid service account JSON for GCS (missing key {e!r}); "
+                    "are you using the correct credentials or should you switch to fs?"
+                ) from e
+            self.client = storage.Client(credentials=credentials, project=info.get('project_id'))
+            self.bucket = self.client.get_bucket(self.bucket_name)
+            self.use_gcsfs = False
+            return
+
+        # if no JSON provided, consider HMAC
+        key_id = os.getenv("GCS_KEY_ID")
+        key_secret = os.getenv("GCS_KEY_SECRET")
+        if key_id and key_secret:
+            # switch to gcsfs for HMAC-based access; the object store paths
+            # are constructed as "bucket_name/path" and the filesystem handles
+            # the low-level GET/PUT operations.
+            try:
+                import gcsfs
+            except ImportError:
+                raise ImportError("gcsfs is required for HMAC GCS auth")
+            token = {"access_key": key_id, "secret_key": key_secret}
+            # project may be optional for HMAC
+            project = os.getenv("GCS_PROJECT")
+            self.fs = gcsfs.GCSFileSystem(project=project, token=token)
+            self.use_gcsfs = True
+            return
+
+        # neither credentials form was available
+        raise ValueError("GCS_SC_JSON environment variable not set and HMAC keys missing.")
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -158,7 +209,10 @@ class GCSStore(StorageBackend):
         return path
 
     def exists(self, path: str) -> bool:
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            return self.fs.exists(f"{self.bucket_name}/{p}")
+        blob = self.bucket.blob(p)
         return blob.exists()
 
     def mkdir(self, path: str, parents: bool = False, exist_ok: bool = False):
@@ -170,37 +224,72 @@ class GCSStore(StorageBackend):
         prefix = self._normalize_path(path)
         if prefix and not prefix.endswith("/"):
             prefix += "/"
-            
-        blobs = self.bucket.list_blobs(prefix=prefix)
+
         results = []
+        if getattr(self, "use_gcsfs", False):
+            listing = self.fs.ls(f"{self.bucket_name}/{prefix}", detail=True)
+            for entry in listing:
+                name = entry["name"] if isinstance(entry, dict) else entry
+                tail = name[len(self.bucket_name) + 1 + len(prefix) :]
+                if "/" not in tail and fnmatch.fnmatch(tail, pattern):
+                    results.append(name[len(self.bucket_name) + 1 :])
+            return results
+
+        blobs = self.bucket.list_blobs(prefix=prefix)
         for blob in blobs:
-            # We matched the prefix, now apply fnmatch to the tail
             name_tail = blob.name[len(prefix):]
             if not "/" in name_tail and fnmatch.fnmatch(name_tail, pattern):
                 results.append(blob.name)
-            # If pattern handles recursive "**" or something, it requires more logic
-            # For our usage, mostly `glob("*.csv")` inside a directory. 
         return results
 
     def read_text(self, path: str) -> str:
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            with self.fs.open(f"{self.bucket_name}/{p}", "r") as f:
+                return f.read()
+        blob = self.bucket.blob(p)
         return blob.download_as_text(encoding="utf-8")
 
     def write_text(self, path: str, text: str):
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            with self.fs.open(f"{self.bucket_name}/{p}", "w") as f:
+                f.write(text)
+            return
+        blob = self.bucket.blob(p)
         blob.upload_from_string(text, content_type="text/plain")
 
     def read_bytes(self, path: str) -> bytes:
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            with self.fs.open(f"{self.bucket_name}/{p}", "rb") as f:
+                return f.read()
+        blob = self.bucket.blob(p)
         return blob.download_as_bytes()
 
     def write_bytes(self, path: str, data: bytes):
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            with self.fs.open(f"{self.bucket_name}/{p}", "wb") as f:
+                f.write(data)
+            return
+        blob = self.bucket.blob(p)
         blob.upload_from_string(data, content_type="application/octet-stream")
 
     def append_bytes(self, path: str, data: bytes):
         # GCS objects are immutable. Append requires reading, cat, and rewrite.
-        blob = self.bucket.blob(self._normalize_path(path))
+        p = self._normalize_path(path)
+        if getattr(self, "use_gcsfs", False):
+            full = f"{self.bucket_name}/{p}"
+            if self.fs.exists(full):
+                existing = self.fs.open(full, "rb").read()
+                new_data = existing + data
+            else:
+                new_data = data
+            with self.fs.open(full, "wb") as f:
+                f.write(new_data)
+            return
+        blob = self.bucket.blob(p)
         if blob.exists():
             existing = blob.download_as_bytes()
             new_data = existing + data
