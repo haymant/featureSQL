@@ -7,7 +7,6 @@ This module delegates Yahoo logic to ``featureSQL.yahoo`` and binary dumping to
 
 from pathlib import Path
 import os
-
 import numpy as np
 import pandas as pd
 from loguru import logger

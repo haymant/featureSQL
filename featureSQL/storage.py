@@ -118,11 +118,6 @@ class GCSStore(StorageBackend):
         json_string = os.getenv("GCS_SC_JSON")
         if json_string:
             # use service account path even if HMAC variables are also set
-            if os.getenv("GCS_KEY_ID") and os.getenv("GCS_KEY_SECRET"):
-                logging.getLogger(__name__).warning(
-                    "both GCS_SC_JSON and GCS_KEY_ID/GCS_KEY_SECRET are set; "
-                    "using service account JSON and ignoring HMAC keys"
-                )
             from google.cloud import storage
             from google.oauth2 import service_account
 
@@ -142,24 +137,10 @@ class GCSStore(StorageBackend):
             self.bucket = self.client.get_bucket(self.bucket_name)
             self.use_gcsfs = False
             return
+        else:
+            raise ImportError("Service account json is not provided via GCS_SC_JSON environment variable.")
 
-        # if no JSON provided, consider HMAC
-        key_id = os.getenv("GCS_KEY_ID")
-        key_secret = os.getenv("GCS_KEY_SECRET")
-        if key_id and key_secret:
-            # switch to gcsfs for HMAC-based access; the object store paths
-            # are constructed as "bucket_name/path" and the filesystem handles
-            # the low-level GET/PUT operations.
-            try:
-                import gcsfs
-            except ImportError:
-                raise ImportError("gcsfs is required for HMAC GCS auth")
-            token = {"access_key": key_id, "secret_key": key_secret}
-            # project may be optional for HMAC
-            project = os.getenv("GCS_PROJECT")
-            self.fs = gcsfs.GCSFileSystem(project=project, token=token)
-            self.use_gcsfs = True
-            return
+
 
         # neither credentials form was available
         raise ValueError("GCS_SC_JSON environment variable not set and HMAC keys missing.")

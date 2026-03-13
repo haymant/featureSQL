@@ -106,6 +106,15 @@ def test_gcs_store_hmac(monkeypatch):
     assert called['token']["access_key"] == "KEYID"
     assert called['token']["secret_key"] == "KEYSECRET"
 
+    # if values are quoted we should strip the quotes automatically
+    monkeypatch.setenv("GCS_KEY_ID", "'KEYID2'")
+    monkeypatch.setenv("GCS_KEY_SECRET", '"KEYSECRET2"')
+    called.clear()
+    store2 = get_storage(StoreType.GCS.value, "bucket123")
+    assert getattr(store2, "use_gcsfs", False) is True
+    assert called['token']["access_key"] == "KEYID2"
+    assert called['token']["secret_key"] == "KEYSECRET2"
+
 def test_gcs_store_bad_json(monkeypatch):
     """Malformed or wrong-type JSON in GCS_SC_JSON should produce a human-
     readable ValueError rather than a raw KeyError.
@@ -116,6 +125,19 @@ def test_gcs_store_bad_json(monkeypatch):
     with pytest.raises(ValueError) as exc:
         GCSStore("bucket123")
     assert "missing key" in str(exc.value)
+
+
+def test_gcs_store_hmac_error_wrap(monkeypatch):
+    """If gcsfs raises a refresh_token KeyError we get a readable ValueError."""
+    monkeypatch.setenv("GCS_KEY_ID", "KEYID")
+    monkeypatch.setenv("GCS_KEY_SECRET", "KEYSECRET")
+    class FakeFS:
+        def __init__(self, project=None, token=None):
+            raise KeyError('refresh_token')
+    monkeypatch.setattr("gcsfs.GCSFileSystem", FakeFS)
+    with pytest.raises(ValueError) as exc:
+        GCSStore("bucket123")
+    assert "HMAC authentication" in str(exc.value)
 
 
 def test_gcs_store_json_over_hmac(monkeypatch, caplog):
